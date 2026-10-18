@@ -22,6 +22,8 @@ pub enum Error {
     VaultExists,
     #[error("there is no vault here")]
     NoVault,
+    #[error("not found")]
+    NotFound,
     #[error("the vault is already open")]
     InUse,
     #[error("the vault is locked")]

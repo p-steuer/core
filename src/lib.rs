@@ -6,15 +6,19 @@
 
 #![forbid(unsafe_code)]
 
+mod blob;
 pub mod crypto;
 pub mod error;
 mod fsio;
+mod id;
 pub mod keys;
 mod rand;
+pub mod store;
 pub mod suite;
 pub mod vault;
 
 pub use error::{Error, Result};
+pub use id::new_record_id;
 
 /// The core's version, for the app's "About" screen and compatibility checks.
 pub fn version() -> &'static str {

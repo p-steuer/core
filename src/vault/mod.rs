@@ -1,41 +1,66 @@
-//! The vault: a folder holding the keyring (and, from milestone M2, the
-//! encrypted journal and files). It is created once with a passphrase and a
-//! recovery key, then opened with either.
+//! The vault: a folder holding the keyring, the encrypted journal and the
+//! encrypted files. It is created once with a passphrase and a recovery key,
+//! then opened with either.
 //!
-//! The keyring is kept twice, `keyring` and `keyring.2`. Changes write the
-//! main copy first (from then on the change counts) and then the backup.
-//! Opening uses the newest copy that is intact and authentic, and rewrites
-//! the other one if it differs.
+//! - **Keyring** (`keyring`, `keyring.2`): changes write the main copy first
+//!   (from then on the change counts) and then the backup. Opening uses the
+//!   newest copy that is intact and authentic, and rewrites the other one if
+//!   it differs.
+//! - **Journal** (`journal-NNNNNNNN.log`, P59): every commit appends one
+//!   encrypted batch and flushes it before the change counts. Opening replays
+//!   it into memory, cuts off an unfinished last batch, and opens read-only if
+//!   anything before it is damaged.
+//! - **Compaction** (P69): writes the surviving state under a new journal key
+//!   into the next generation, switches to it, then deletes the old key and
+//!   file. A crash at any step leaves either generation complete.
+//! - **Files** (`blobs/<id>.blob`): each with its own key, kept in the journal.
+//!
+//! When a write fails so that the state on disk is uncertain, the vault
+//! refuses further changes until it is opened again.
 
 mod keyring;
 mod lock;
 
+use std::collections::BTreeSet;
+use std::fs::File;
 use std::path::Path;
 
+use serde_json::{Map, Value};
 use zeroize::Zeroizing;
 
+use crate::blob;
 use crate::crypto::SecretKey;
 use crate::crypto::pwhash::{self, Params};
 use crate::fsio::Dir;
 use crate::keys::passphrase;
 use crate::keys::recovery::RecoveryKey;
-use crate::rand::{OsRng, Rng};
+use crate::rand::{self, OsRng, Rng};
+use crate::store::hlc::{self, Clock};
+use crate::store::journal::{self, End};
+use crate::store::{self, Batch, Change, Op, Record, Store};
 use crate::{Error, Result};
 use keyring::{Keyring, KeyringKeys, PURPOSE_JOURNAL, PassphraseSlot, RecoverySlot};
 use lock::VaultLock;
 
 const KEYRING: &str = "keyring";
 const KEYRING_BACKUP: &str = "keyring.2";
+const BLOBS: &str = "blobs";
+/// The core's own record kind for file keys; the app can't see it.
+const BLOB_KIND: &str = "_blob";
+/// Compaction splits the surviving state into batches of about this size.
+const SNAPSHOT_BATCH: usize = 256 * 1024;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Config {
     /// Argon2id parameters for new passphrase slots, and the upgrade target.
     pub params: Params,
+    pub clock: Clock,
 }
 
 impl Config {
     pub(crate) const PRODUCTION: Self = Self {
         params: pwhash::DEFAULT,
+        clock: Clock::System,
     };
 }
 
@@ -49,6 +74,10 @@ pub struct Status {
     /// The backup copy of the keyring couldn't be written; the next unlock
     /// repairs it.
     pub keyring_backup_stale: bool,
+    /// An unfinished last change (left by a crash or power cut) was discarded.
+    pub recovered_journal: bool,
+    /// Why the vault can only be read, if it can.
+    pub damage: Option<&'static str>,
 }
 
 /// A vault prepared in memory: the passphrase is hashed and the recovery key
@@ -106,10 +135,15 @@ impl PendingVault {
             return Err(Error::VaultExists);
         }
         remove_leftovers(&dir)?;
+        // The empty journal first: until the keyring exists there is no vault,
+        // and a later setup removes the journal again.
+        let header = journal::header(self.keyring.suite, &self.keyring.vault_id, 1);
+        let name = journal::file_name(1);
+        dir.write_atomic(&name, &header)?;
         let backup_ok = save(&dir, &self.keyring)?;
+        let file = dir.open_append(&name)?;
         let keys = KeyringKeys::derive(&self.mk, self.keyring.suite, &self.keyring.vault_id);
         Ok(Vault {
-            dir,
             config: self.config,
             status: Status {
                 keyring_backup_stale: !backup_ok,
@@ -117,12 +151,23 @@ impl PendingVault {
             },
             open: Some(Open {
                 _lock: lock,
+                blobs: dir.sub(BLOBS),
                 mk: self.mk,
                 keys,
                 keyring: self.keyring,
-                journal_keys: vec![(1, self.journal_key)],
+                journal: ActiveJournal {
+                    generation: 1,
+                    key: self.journal_key,
+                    header,
+                    file,
+                    len: journal::HEADER_LEN as u64,
+                    next_seq: 1,
+                },
+                store: Store::default(),
+                hlc: 0,
                 pending_recovery: None,
             }),
+            dir,
         })
     }
 }
@@ -146,12 +191,24 @@ impl std::fmt::Debug for Vault {
 
 struct Open {
     _lock: VaultLock,
+    blobs: Dir,
     mk: SecretKey,
     keys: KeyringKeys,
     keyring: Keyring,
-    #[allow(dead_code)] // read by the journal (M2)
-    journal_keys: Vec<(u32, SecretKey)>,
+    journal: ActiveJournal,
+    store: Store,
+    /// The last clock value written.
+    hlc: u64,
     pending_recovery: Option<RecoveryKey>,
+}
+
+struct ActiveJournal {
+    generation: u32,
+    key: SecretKey,
+    header: journal::Header,
+    file: File,
+    len: u64,
+    next_seq: u64,
 }
 
 pub(crate) enum Secret {
@@ -188,90 +245,84 @@ impl Vault {
         }
         let lock = VaultLock::acquire(&dir)?;
         remove_temp_files(&dir)?;
-
-        let mut copies: Vec<(Vec<u8>, Keyring)> = Vec::new();
-        let mut parse_error = None;
-        for name in [KEYRING, KEYRING_BACKUP] {
-            if let Some(bytes) = dir.read(name)? {
-                match Keyring::parse(&bytes) {
-                    Ok(k) => copies.push((bytes, k)),
-                    Err(e) => {
-                        parse_error.get_or_insert(e);
-                    }
-                }
-            }
-        }
-        if copies.is_empty() {
-            return Err(parse_error.unwrap_or(Error::NoVault));
-        }
-        // Newest first; on a tie the main copy first (the sort is stable).
-        copies.sort_by_key(|c| std::cmp::Reverse(c.1.seq));
-
-        let (used, mk) = open_master_key(&copies, &secret)?;
-
-        // The newest copy that is authentic under this master key wins.
-        let mut chosen = None;
-        for (i, (_, k)) in copies.iter().enumerate() {
-            let keys = KeyringKeys::derive(&mk, k.suite, &k.vault_id);
-            if k.verify_mac(&keys).is_ok()
-                && let Ok(journal_keys) = k.open_data_keys(&keys, PURPOSE_JOURNAL)
-            {
-                chosen = Some((i, keys, journal_keys));
-                break;
-            }
-        }
-        let (auth, keys, journal_keys) = chosen.ok_or(Error::Damaged("keyring authentication"))?;
-        let mut keyring = copies[auth].1.clone();
         let mut status = Status::default();
+        let (mk, keys, mut keyring, journal_keys) =
+            open_keyring(&dir, &secret, &config, rng, &mut status)?;
 
-        // Repair the other copy: best effort, opening doesn't depend on it.
-        for name in [KEYRING, KEYRING_BACKUP] {
-            if dir.read(name)?.as_deref() != Some(&copies[auth].0[..]) {
-                if dir.write_atomic(name, &copies[auth].0).is_ok() {
-                    status.repaired_keyring = true;
-                } else {
-                    status.keyring_backup_stale = true;
+        // The active generation: the newest one with both a file and a key.
+        let files: BTreeSet<u32> = dir
+            .list()?
+            .iter()
+            .filter_map(|n| journal::generation_of(n))
+            .collect();
+        let Some((generation, key)) = journal_keys
+            .into_iter()
+            .filter(|(g, _)| files.contains(g))
+            .max_by_key(|(g, _)| *g)
+        else {
+            return Err(Error::Damaged("journal missing"));
+        };
+        let header = journal::header(keyring.suite, &keyring.vault_id, generation);
+        let name = journal::file_name(generation);
+        let bytes = dir.read(&name)?.ok_or(Error::Damaged("journal missing"))?;
+        let contents = journal::read(&bytes, &key, &header, &keyring.device_id)?;
+        let mut store = Store::default();
+        let mut damage = None;
+        for (seq, plaintext) in &contents.frames {
+            match serde_json::from_slice::<Batch>(plaintext) {
+                Ok(batch) => store.apply(&batch, keyring.device_id, *seq),
+                Err(_) => {
+                    damage = Some("journal batch");
+                    break;
                 }
             }
         }
-
-        // Re-wrap with stronger Argon2id parameters, but only the slot this
-        // passphrase really opened (never undo a newer passphrase change).
-        // Best effort: if anything fails, keep the old parameters and try
-        // again at the next unlock.
-        if let Secret::Passphrase(pw) = &secret
-            && copies[used].1.passphrase == keyring.passphrase
-            && keyring.passphrase.params.should_upgrade_to(&config.params)
-            && let Ok(slot) = PassphraseSlot::seal(
-                rng,
-                pw,
-                &config.params,
-                keyring.suite,
-                &keyring.vault_id,
-                &mk,
-            )
-        {
-            let mut updated = keyring.clone();
-            updated.passphrase = slot;
-            updated.seq += 1;
-            updated.seal_mac(&keys);
-            if let Ok(backup_ok) = save(&dir, &updated) {
-                keyring = updated;
-                status.upgraded_passphrase_hashing = true;
-                status.keyring_backup_stale = !backup_ok;
+        let mut len = bytes.len() as u64;
+        let file = dir.open_append(&name)?;
+        match contents.end {
+            End::Clean => {}
+            End::Damaged(_, reason) => {
+                damage.get_or_insert(reason);
             }
+            End::Torn(at) if damage.is_none() => {
+                dir.truncate(&file, at)?;
+                len = at;
+                status.recovered_journal = true;
+            }
+            End::Torn(_) => {}
         }
+        let next_seq = contents.frames.len() as u64 + 1;
+        drop(contents);
+        status.damage = damage;
 
+        let blobs = dir.sub(BLOBS);
+        if damage.is_none() {
+            // Leftovers of an interrupted compaction or file change. Best
+            // effort: nothing depends on them.
+            let _ = clean_up_generations(&dir, &mut keyring, &keys, generation, &files);
+            let _ = clean_up_blobs(&blobs, &store);
+        }
+        let hlc = store.max_hlc();
         Ok(Self {
             dir,
             config,
             status,
             open: Some(Open {
                 _lock: lock,
+                blobs,
                 mk,
                 keys,
                 keyring,
-                journal_keys,
+                journal: ActiveJournal {
+                    generation,
+                    key,
+                    header,
+                    file,
+                    len,
+                    next_seq,
+                },
+                store,
+                hlc,
                 pending_recovery: None,
             }),
         })
@@ -293,6 +344,266 @@ impl Vault {
     fn opened(&self) -> Result<&Open> {
         self.open.as_ref().ok_or(Error::Locked)
     }
+
+    /// The open vault, if changes are allowed.
+    fn writable(&mut self) -> Result<&mut Open> {
+        let open = self.open.as_mut().ok_or(Error::Locked)?;
+        if self.status.damage.is_some() {
+            return Err(Error::ReadOnly);
+        }
+        Ok(open)
+    }
+
+    // ---- Records ----------------------------------------------------------
+
+    /// The records of one kind, sorted by id.
+    pub fn records(&self, kind: &str) -> Result<Vec<Record>> {
+        store::check_kind(kind)?;
+        Ok(self.opened()?.store.records(kind))
+    }
+
+    pub fn record(&self, kind: &str, id: &str) -> Result<Option<Record>> {
+        store::check_kind(kind)?;
+        Ok(self.opened()?.store.get(kind, id))
+    }
+
+    /// Applies `changes` together: on disk and flushed before this returns,
+    /// or not at all.
+    pub fn commit(&mut self, changes: Vec<Change>) -> Result<()> {
+        store::validate(&changes)?;
+        self.commit_ops(changes.into_iter().map(Op::from).collect())
+    }
+
+    fn commit_ops(&mut self, ops: Vec<Op>) -> Result<()> {
+        let now = self.config.clock.now_ms();
+        let Vault {
+            dir, status, open, ..
+        } = self;
+        let open = open.as_mut().ok_or(Error::Locked)?;
+        if status.damage.is_some() {
+            return Err(Error::ReadOnly);
+        }
+        let batch = Batch {
+            hlc: hlc::next(open.hlc, now),
+            ops,
+        };
+        let mut plaintext = Zeroizing::new(
+            serde_json::to_vec(&batch).map_err(|_| Error::Internal("encoding a batch"))?,
+        );
+        journal::pad(&mut plaintext);
+        let j = &mut open.journal;
+        let seq = j.next_seq;
+        let frame = journal::seal_frame(
+            &j.key,
+            &j.header,
+            &open.keyring.device_id,
+            seq,
+            &plaintext,
+            &mut OsRng,
+        )?;
+        if let Err(e) = dir.append(&mut j.file, &frame) {
+            // Take back a partial frame; if even that fails, a later frame
+            // would land behind garbage, so stop writing.
+            if dir.truncate(&j.file, j.len).is_err() {
+                status.damage = Some("storage error; open the vault again");
+            }
+            return Err(e);
+        }
+        j.len += frame.len() as u64;
+        j.next_seq += 1;
+        open.hlc = batch.hlc;
+        open.store.apply(&batch, open.keyring.device_id, seq);
+        Ok(())
+    }
+
+    /// Whether [`Vault::compact`] would remove deleted or overwritten values.
+    pub fn needs_compaction(&self) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|o| o.store.needs_compaction())
+    }
+
+    /// Rewrites the journal with only the surviving state under a new key,
+    /// then deletes the old key and file (P69).
+    pub fn compact(&mut self) -> Result<()> {
+        let now = self.config.clock.now_ms();
+        let dir = &self.dir;
+        let status = &mut self.status;
+        let open = self.open.as_mut().ok_or(Error::Locked)?;
+        if status.damage.is_some() {
+            return Err(Error::ReadOnly);
+        }
+        let old = open.journal.generation;
+        let new = old
+            .checked_add(1)
+            .ok_or(Error::Internal("journal generation"))?;
+        let key = SecretKey::random(&mut OsRng)?;
+
+        // 1. The keyring with both keys (a stale key of an earlier attempt goes).
+        let mut both = open.keyring.clone();
+        both.data_keys.retain(|k| k.generation <= old);
+        both.add_data_key(&mut OsRng, &open.keys, PURPOSE_JOURNAL, new, &key)?;
+        both.seq += 1;
+        both.seal_mac(&open.keys);
+        status.keyring_backup_stale = !save(dir, &both)?;
+        open.keyring = both;
+
+        // 2. The new journal, complete, under its final name.
+        let header = journal::header(open.keyring.suite, &open.keyring.vault_id, new);
+        let mut bytes = header.to_vec();
+        let hlc = hlc::next(open.hlc, now);
+        let mut seq = 0;
+        for ops in split(open.store.snapshot()) {
+            seq += 1;
+            let mut plaintext = Zeroizing::new(
+                serde_json::to_vec(&Batch { hlc, ops })
+                    .map_err(|_| Error::Internal("encoding a batch"))?,
+            );
+            journal::pad(&mut plaintext);
+            bytes.extend(journal::seal_frame(
+                &key,
+                &header,
+                &open.keyring.device_id,
+                seq,
+                &plaintext,
+                &mut OsRng,
+            )?);
+        }
+        let name = journal::file_name(new);
+        if let Err(e) = dir.write_atomic(&name, &bytes) {
+            // If the file arrived after all, the next unlock would use it
+            // and miss later commits to the old one: remove it or stop.
+            if dir.remove(&name).is_err() {
+                status.damage = Some("storage error; open the vault again");
+            }
+            return Err(e);
+        }
+
+        // 3. Switch over. From here on the new generation counts.
+        let file = match dir.open_append(&name) {
+            Ok(f) => f,
+            Err(e) => {
+                status.damage = Some("storage error; open the vault again");
+                return Err(e);
+            }
+        };
+        open.journal = ActiveJournal {
+            generation: new,
+            key,
+            header,
+            file,
+            len: bytes.len() as u64,
+            next_seq: seq + 1,
+        };
+        open.hlc = hlc;
+        open.store = open.store.compacted();
+
+        // 4. Delete the old key, then the old file. If this fails, the next
+        // unlock finishes it.
+        let mut only_new = open.keyring.clone();
+        only_new.data_keys.retain(|k| k.generation == new);
+        only_new.seq += 1;
+        only_new.seal_mac(&open.keys);
+        if let Ok(backup_ok) = save(dir, &only_new) {
+            open.keyring = only_new;
+            status.keyring_backup_stale = !backup_ok;
+            let _ = dir
+                .remove(&journal::file_name(old))
+                .and_then(|_| dir.sync());
+        }
+        Ok(())
+    }
+
+    // ---- Files --------------------------------------------------------------
+
+    /// Stores an encrypted file and returns its id.
+    pub fn put_blob(&mut self, data: &[u8]) -> Result<String> {
+        let open = self.writable()?;
+        let id_bytes: [u8; 16] = rand::array(&mut OsRng)?;
+        let id = store::hex16(&id_bytes);
+        let key = SecretKey::random(&mut OsRng)?;
+        let sealed = blob::seal(
+            &key,
+            open.keyring.suite,
+            &open.keyring.vault_id,
+            &id_bytes,
+            data,
+            &mut OsRng,
+        )?;
+        open.blobs.create_dir()?;
+        let name = format!("{id}.blob");
+        open.blobs.write_atomic(&name, &sealed)?;
+        let mut fields = Map::new();
+        fields.insert(
+            "key".into(),
+            Value::String(hex32(key.as_bytes()).to_string()),
+        );
+        let result = self.commit_ops(vec![Op::Put {
+            kind: BLOB_KIND.into(),
+            id: id.clone(),
+            fields,
+        }]);
+        if let Err(e) = result {
+            if let Some(open) = self.open.as_ref() {
+                let _ = open.blobs.remove(&name);
+            }
+            return Err(e);
+        }
+        Ok(id)
+    }
+
+    pub fn get_blob(&self, id: &str) -> Result<Zeroizing<Vec<u8>>> {
+        let open = self.opened()?;
+        let id_bytes = store::unhex16(id).ok_or(Error::InvalidInput("file id"))?;
+        let record = open.store.get(BLOB_KIND, id).ok_or(Error::NotFound)?;
+        let key = record
+            .fields
+            .get("key")
+            .and_then(Value::as_str)
+            .and_then(unhex32)
+            .ok_or(Error::Damaged("file key"))?;
+        let bytes = open
+            .blobs
+            .read(&format!("{id}.blob"))?
+            .ok_or(Error::Damaged("file missing"))?;
+        blob::open(
+            &key,
+            open.keyring.suite,
+            &open.keyring.vault_id,
+            &id_bytes,
+            &bytes,
+        )
+    }
+
+    /// Deletes a file. Its key disappears with the next compaction.
+    pub fn delete_blob(&mut self, id: &str) -> Result<()> {
+        store::unhex16(id).ok_or(Error::InvalidInput("file id"))?;
+        if self.opened()?.store.get(BLOB_KIND, id).is_none() {
+            return Err(Error::NotFound);
+        }
+        self.commit_ops(vec![Op::Del {
+            kind: BLOB_KIND.into(),
+            id: id.to_owned(),
+        }])?;
+        if let Some(open) = self.open.as_ref() {
+            let _ = open.blobs.remove(&format!("{id}.blob"));
+        }
+        Ok(())
+    }
+
+    /// The ids of all stored files, so the app can delete those no record
+    /// refers to any more.
+    pub fn blob_ids(&self) -> Result<Vec<String>> {
+        Ok(self
+            .opened()?
+            .store
+            .records(BLOB_KIND)
+            .into_iter()
+            .map(|r| r.id)
+            .collect())
+    }
+
+    // ---- Passphrase and recovery key ----------------------------------------
 
     /// Whether `passphrase` is the current one (for confirming before a change).
     pub fn verify_passphrase(&self, passphrase: &str) -> Result<bool> {
@@ -386,6 +697,92 @@ impl Vault {
     }
 }
 
+/// The master key, its derived keys, the keyring copy in use and the
+/// unwrapped journal keys by generation.
+type OpenedKeyring = (SecretKey, KeyringKeys, Keyring, Vec<(u32, SecretKey)>);
+
+/// Opens the master key and chooses the keyring copy to use (M1).
+fn open_keyring(
+    dir: &Dir,
+    secret: &Secret,
+    config: &Config,
+    rng: &mut dyn Rng,
+    status: &mut Status,
+) -> Result<OpenedKeyring> {
+    let mut copies: Vec<(Vec<u8>, Keyring)> = Vec::new();
+    let mut parse_error = None;
+    for name in [KEYRING, KEYRING_BACKUP] {
+        if let Some(bytes) = dir.read(name)? {
+            match Keyring::parse(&bytes) {
+                Ok(k) => copies.push((bytes, k)),
+                Err(e) => {
+                    parse_error.get_or_insert(e);
+                }
+            }
+        }
+    }
+    if copies.is_empty() {
+        return Err(parse_error.unwrap_or(Error::NoVault));
+    }
+    // Newest first; on a tie the main copy first (the sort is stable).
+    copies.sort_by_key(|c| std::cmp::Reverse(c.1.seq));
+
+    let (used, mk) = open_master_key(&copies, secret)?;
+
+    // The newest copy that is authentic under this master key wins.
+    let mut chosen = None;
+    for (i, (_, k)) in copies.iter().enumerate() {
+        let keys = KeyringKeys::derive(&mk, k.suite, &k.vault_id);
+        if k.verify_mac(&keys).is_ok()
+            && let Ok(journal_keys) = k.open_data_keys(&keys, PURPOSE_JOURNAL)
+        {
+            chosen = Some((i, keys, journal_keys));
+            break;
+        }
+    }
+    let (auth, keys, journal_keys) = chosen.ok_or(Error::Damaged("keyring authentication"))?;
+    let mut keyring = copies[auth].1.clone();
+
+    // Repair the other copy: best effort, opening doesn't depend on it.
+    for name in [KEYRING, KEYRING_BACKUP] {
+        if dir.read(name)?.as_deref() != Some(&copies[auth].0[..]) {
+            if dir.write_atomic(name, &copies[auth].0).is_ok() {
+                status.repaired_keyring = true;
+            } else {
+                status.keyring_backup_stale = true;
+            }
+        }
+    }
+
+    // Re-wrap with stronger Argon2id parameters, but only the slot this
+    // passphrase really opened (never undo a newer passphrase change). Best
+    // effort: if anything fails, keep the old parameters and try again at the
+    // next unlock.
+    if let Secret::Passphrase(pw) = secret
+        && copies[used].1.passphrase == keyring.passphrase
+        && keyring.passphrase.params.should_upgrade_to(&config.params)
+        && let Ok(slot) = PassphraseSlot::seal(
+            rng,
+            pw,
+            &config.params,
+            keyring.suite,
+            &keyring.vault_id,
+            &mk,
+        )
+    {
+        let mut updated = keyring.clone();
+        updated.passphrase = slot;
+        updated.seq += 1;
+        updated.seal_mac(&keys);
+        if let Ok(backup_ok) = save(dir, &updated) {
+            keyring = updated;
+            status.upgraded_passphrase_hashing = true;
+            status.keyring_backup_stale = !backup_ok;
+        }
+    }
+    Ok((mk, keys, keyring, journal_keys))
+}
+
 /// Opens the master key with the first copy whose slot accepts the secret.
 fn open_master_key(copies: &[(Vec<u8>, Keyring)], secret: &Secret) -> Result<(usize, SecretKey)> {
     // Argon2id results by (salt, parameters): both copies usually share the
@@ -429,6 +826,80 @@ fn open_master_key(copies: &[(Vec<u8>, Keyring)], secret: &Secret) -> Result<(us
     Err(wrong_secret.or(other_error).expect("at least one copy"))
 }
 
+/// Finishes an interrupted compaction: keys and files of other generations go.
+fn clean_up_generations(
+    dir: &Dir,
+    keyring: &mut Keyring,
+    keys: &KeyringKeys,
+    active: u32,
+    files: &BTreeSet<u32>,
+) -> Result<()> {
+    if keyring.data_keys.iter().any(|k| k.generation != active) {
+        let mut updated = keyring.clone();
+        updated.data_keys.retain(|k| k.generation == active);
+        updated.seq += 1;
+        updated.seal_mac(keys);
+        save(dir, &updated)?;
+        *keyring = updated;
+    }
+    for g in files.iter().filter(|g| **g != active) {
+        dir.remove(&journal::file_name(*g))?;
+    }
+    dir.sync()
+}
+
+/// Removes files without a key: left by a crash between writing a file and
+/// committing its key, or between deleting the key and the file.
+fn clean_up_blobs(blobs: &Dir, store: &Store) -> Result<()> {
+    if !blobs.path().exists() {
+        return Ok(());
+    }
+    for name in blobs.list()? {
+        let keep = name
+            .strip_suffix(".blob")
+            .is_some_and(|id| store.get(BLOB_KIND, id).is_some());
+        if !keep {
+            blobs.remove(&name)?;
+        }
+    }
+    Ok(())
+}
+
+/// Splits snapshot operations into batches of about [`SNAPSHOT_BATCH`] bytes.
+fn split(ops: Vec<Op>) -> Vec<Vec<Op>> {
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut size = 0;
+    for op in ops {
+        let n = serde_json::to_vec(&op).map(|v| v.len()).unwrap_or(0);
+        if !current.is_empty() && size + n > SNAPSHOT_BATCH {
+            batches.push(std::mem::take(&mut current));
+            size = 0;
+        }
+        size += n;
+        current.push(op);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+fn hex32(b: &[u8; 32]) -> Zeroizing<String> {
+    Zeroizing::new(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
+fn unhex32(s: &str) -> Option<SecretKey> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut key = SecretKey::zero();
+    for (i, o) in key.as_mut_bytes().iter_mut().enumerate() {
+        *o = u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(key)
+}
+
 /// Writes a changed keyring: the main copy first (from then on the change
 /// counts), then the backup. Returns whether the backup was written.
 fn save(dir: &Dir, keyring: &Keyring) -> Result<bool> {
@@ -451,12 +922,20 @@ fn remove_temp_files(dir: &Dir) -> Result<()> {
 /// Without a keyring they can never be decrypted.
 fn remove_leftovers(dir: &Dir) -> Result<()> {
     for name in dir.list()? {
-        if name.ends_with(".tmp") || (name.starts_with("journal-") && name.ends_with(".log")) {
+        if name.ends_with(".tmp") || journal::generation_of(&name).is_some() {
             dir.remove(&name)?;
+        }
+    }
+    let blobs = dir.sub(BLOBS);
+    if blobs.path().exists() {
+        for name in blobs.list()? {
+            blobs.remove(&name)?;
         }
     }
     Ok(())
 }
 
+#[cfg(test)]
+mod store_tests;
 #[cfg(test)]
 mod tests;

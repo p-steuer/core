@@ -31,7 +31,7 @@
 \newcommand{\todo}[1]{\textcolor{red!70!black}{[\textbf{Open:} #1]}}
 \newcommand{\dref}[1]{\textsf{#1}} % reference to the decision log in APPDESIGN.md
 
-\title{Cryptographic design of the security core\\[2pt]\large Draft 0.2}
+\title{Cryptographic design of the security core\\[2pt]\large Draft 0.3}
 \author{Internal working document}
 \date{18 October 2026}
 
@@ -39,7 +39,7 @@
 \maketitle
 
 \begin{abstract}
-This document specifies the cryptography of the app's security core (the Rust crate \texttt{secure\_core}): goals, threat model, primitives and cipher suites, the key hierarchy, data at rest, synchronisation, device pairing and sharing. Draft 0.2 adds what milestone M1 of MVP~1 implements: the libraries and parameters of suite~1, passphrase handling, the recovery key and the keyring file (\cref{sec:passphrase,sec:recovery,sec:keyring}). It turns the decisions and proposals of the project's decision log (\texttt{APPDESIGN.md}; identifiers such as \dref{D9} or \dref{P43}) into a precise design that can be reviewed, formally analysed and implemented. Everything not yet decided is marked \todo{like this}. The app's name is deliberately absent; it lives only in the app's \texttt{branding.json} (\dref{D35}).
+This document specifies the cryptography of the app's security core (the Rust crate \texttt{secure\_core}): goals, threat model, primitives and cipher suites, the key hierarchy, data at rest, synchronisation, device pairing and sharing. Draft 0.2 added what milestone M1 of MVP~1 implements: the libraries and parameters of suite~1, passphrase handling, the recovery key and the keyring file (\cref{sec:passphrase,sec:recovery,sec:keyring}). Draft 0.3 adds milestone M2: the journal, merging, compaction and encrypted files (\cref{sec:rest}). It turns the decisions and proposals of the project's decision log (\texttt{APPDESIGN.md}; identifiers such as \dref{D9} or \dref{P43}) into a precise design that can be reviewed, formally analysed and implemented. Everything not yet decided is marked \todo{like this}. The app's name is deliberately absent; it lives only in the app's \texttt{branding.json} (\dref{D35}).
 \end{abstract}
 
 \tableofcontents
@@ -209,15 +209,45 @@ checksum (32) & SHA-256 of everything before \\
 \section{Data at rest}
 \label{sec:rest}
 
-\subsection{Records}
-Each record (set, session, measurement, \ldots) has an identifier, a kind and flat fields. Draft 0.1 encrypted each record on its own; MVP~1 instead keeps an append-only encrypted journal of operation batches (\dref{P59}): edits and deletions are new operations, the journal is replayed into memory at unlock, and the app queries in memory. Identifiers, kinds and timestamps are inside the ciphertext. Its format, compaction (\dref{P69}) and the crash tests are specified with milestone M2 \todo{journal and blob formats, Draft 0.3}.
+\subsection{Records and the journal}
+\label{sec:journal}
+A record (set, session, measurement, \ldots) is a kind, an identifier (UUID version~7) and flat fields: numbers, text, booleans. The core knows nothing about what they mean. Draft 0.1 encrypted each record on its own; MVP~1 instead keeps an append-only encrypted \emph{journal} of operation batches (\dref{P59}), replayed into memory at unlock; the app queries in memory. Edits and deletions are new operations. Identifiers, kinds, field names and timestamps are all inside the ciphertext.
+
+\noindent\textbf{File format~1} (one file per generation $g$, \texttt{journal-}$g$\texttt{.log}, little-endian):
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+header (32 bytes) & magic \texttt{SCJOURNL}, format (u16, 1), suite (u16), $\mathit{vault\_id}$ (16), generation $g$ (u32) \\
+each frame & $\ell$ (u32), $\lnot\ell$ (u32), kind (u8, 1 = batch), $\mathit{device\_id}$ (16), $\mathit{seq}$ (u64), nonce (24), ciphertext with tag ($\ell - 49$) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+A frame is $\AEAD.\Enc(K_{j,g}, n, \mathit{batch}, \mathit{header} \concat \ell \concat \lnot\ell \concat \mathit{kind} \concat \mathit{device\_id} \concat \mathit{seq})$, so it can't be moved to another vault, generation, device or position. $\mathit{seq}$ starts at 1 in every file and increases by one. The plaintext is a JSON batch $\{\mathit{hlc}, \mathit{ops}\}$, padded with spaces to a multiple of 128 bytes, at most 1\,MiB. Operations: \emph{put} (set fields; others stay; \texttt{null} clears one), \emph{del} (a tombstone) and \emph{snap} (written by compaction, below).
+
+\noindent\textbf{Commit}: validate everything first; encrypt the batch; append it in one write and \texttt{fsync} it; only then apply it in memory. If the append fails, the partial frame is cut off again; if even that fails, the vault refuses further changes until it is reopened, because a new frame behind garbage would look like damage.
+
+\noindent\textbf{Reading}: a crash can leave only an unfinished or garbled \emph{last} frame (a prefix of the append, or zeros where the file grew but the data didn't arrive). That is a \emph{torn end}: it is cut off and reported (\texttt{recovered\_journal}). Anything wrong before the last frame --- a frame that doesn't decrypt, a sequence gap or repetition, a frame of another device --- is \emph{damage}: the vault opens read-only with the batches before it, and nothing is deleted. The complement $\lnot\ell$ keeps the two apart: without it, one flipped bit in an early frame's length could make all later frames look like one unfinished last frame, and they would be cut off. With it, every single-bit change before the last frame is reported as damage (tested for every bit of a frame). Dropping whole frames at the end can't be detected locally (no rollback protection on one device).
+
+\noindent\textbf{Merging} (\dref{P22}--\dref{P25}): every write has a stamp $(\mathit{hlc}, \mathit{device\_id}, \mathit{seq}, \mathit{index})$, ordered lexicographically; $\mathit{hlc}$ is a hybrid logical clock (milliseconds in the upper 48 bits, a counter in the lower 16) that only increases, even when the device clock is set back. Per field the highest stamp wins; a record is visible if its latest put is newer than its latest deletion, and only fields written after the deletion are visible. Merging is commutative and idempotent (property tests over random histories from two devices, shuffled and duplicated).
+
+\noindent\textbf{Compaction with crypto-shredding} (\dref{P69}), from generation $g$ to $g + 1$:
+\begin{enumerate}
+  \item Add a fresh random key $K_{j,g+1}$ to the keyring (both copies).
+  \item Write \texttt{journal-}$(g{+}1)$\texttt{.log} atomically: the visible records only, as \emph{snap} operations that keep each surviving value's original stamp (so a later merge with other devices stays correct), in batches of about 256\,KiB. Deleted records and overwritten or deleted values are left out.
+  \item Switch to generation $g + 1$ in memory. From here on it counts: if writing the file reported an error but the file might exist, the core removes it or refuses further changes, because the next unlock would otherwise read it and miss later commits.
+  \item Remove $K_{j,g}$ from the keyring, then the old file.
+\end{enumerate}
+Unlock uses the newest generation that has both a file and a key, and finishes an interrupted compaction by removing other keys and files. Tests crash at each of the 26 steps; afterwards the vault always shows the same records, holds exactly one key and one journal, and takes new commits. Single-device simplification: compaction drops tombstones too; with sync they must be kept until every device has seen them \todo{tombstone retention with sync}. When to compact: the core reports it as due after any deletion or when overwritten values outnumber live ones two to one; the app compacts after a deletion's undo window has closed and before locking.
 
 \subsection{App settings}
 App settings (units, language, theme, timer defaults and alarms, enabled areas) describe how the app behaves, not the athlete. They are stored unencrypted on the device (\dref{D39}), which also lets the app show the right language before it is unlocked. When synced they travel inside the encrypted sync batches like any record (\dref{P58}). Anything that describes the person (profile, weight class, sports) is a record and encrypted.
 
 \subsection{Large files: photos and videos}
 \label{sec:blobs}
-A random file key $K_f$, wrapped under $K_{\mathrm{files}}$, encrypts the file in chunks of fixed size (e.g.\ 64\,KiB). Chunk $i$ is encrypted with associated data $h \concat \mathit{fid} \concat i \concat \mathit{is\_last}$, so chunks can be decrypted individually (seeking in videos, \dref{P34}) while reordering and truncation are detected. Location metadata is removed before encryption.
+Each file has a random identifier $\mathit{fid}$ (128 bits) and its own random key $K_f$, kept in a core-internal record of the journal (invisible to the app), so deleting the file's record and compacting destroys the key like any other value. File format~1, \texttt{blobs/}$\mathit{fid}$\texttt{.blob}: a 64-byte header (magic \texttt{SCBLOBFL}, format, suite, $\mathit{vault\_id}$, $\mathit{fid}$, chunk size, a random 16-byte nonce prefix $p$), then the file in chunks of 64\,KiB; chunk $i$ is $\AEAD.\Enc(K_f, p \concat i_{\mathrm{BE64}}, \mathit{chunk}_i, \mathit{header} \concat i \concat \mathit{is\_last})$, all full-size except the last; an empty file is one empty last chunk. Chunks can be decrypted on their own (seeking in videos later, \dref{P34}) while reordering, truncation, appending and moving to another vault or file are detected (tested). The file is written atomically before its key is committed; unlock removes files without a key (left by a crash in between). Photos are re-encoded by the app before storing, which removes location and other metadata (\dref{D43}).
+
+\subsection{What is on disk}
+The vault folder holds \texttt{LOCK}, \texttt{keyring}, \texttt{keyring.2}, one \texttt{journal-}$g$\texttt{.log} and \texttt{blobs/}. A test fills a vault with marked values (a name, notes, a photo), compacts, writes more, and searches every file for the markers and for field and kind names: none appears.
 
 \section{Synchronisation}
 \label{sec:sync}
@@ -264,6 +294,7 @@ Storage providers see the number, sizes and timing of encrypted files. Mitigatio
 
 \begin{itemize}
   \item \textbf{Vetted libraries} behind the suite registry: libsodium 1.0.22 (X-Wing, ML-KEM, XChaCha20-Poly1305, Argon2id, Ed25519); libcrux for ML-DSA (formally verified with hax and F*).
+  \item \textbf{Tests implemented in M2}: journal truncation at every byte, every flipped bit of a frame, gaps, repetitions and frames of other vaults, generations or devices; a golden journal file; merge property tests; crash points at every step of commits, compaction and storing files; the plaintext search of the previous section.
   \item \textbf{Tests implemented in M1}: through the core's own wrappers, draft-irtf-cfrg-xchacha-03 A.3.1 \cite{xchacha} and all 315 Wycheproof XChaCha20-Poly1305 tests \cite{wycheproof}; RFC 9106 §5.3 (Argon2id); RFC 5869 A.1--A.3 (HKDF-SHA-256); property tests (any changed bit, associated data or nonce is rejected); a golden keyring file; the tamper and crash tests of \cref{sec:keyring}; valgrind memcheck over the test binary.
   \item \textbf{Tests} (\texttt{CLAUDE.md}): official test vectors (NIST ACVP, Wycheproof) and our own known-answer tests for every format; a regression test for every fixed bug; fuzzing of all parsers (\texttt{cargo-fuzz}); Miri for any \texttt{unsafe} code; valgrind-based constant-time checks (e.g.\ ctgrind-style) and sanitizers.
   \item \textbf{Formal analysis} of pairing, sync and sharing (ProVerif or Tamarin) before launch; machine-checked implementations where feasible.
@@ -276,6 +307,7 @@ Storage providers see the number, sizes and timing of encrypted files. Mitigatio
   \item Argon2id timing on real phones and in browsers with memory limits (\cref{sec:passphrase}).
   \item The minimum passphrase length: 12 or 15 characters (\cref{sec:passphrase}).
   \item A ``re-key everything'' action after a compromised passphrase (\cref{sec:keys}).
+  \item Keeping tombstones until all devices have seen them, once sync arrives (\cref{sec:journal}).
   \item The optional secret key (\dref{P18}).
   \item How often to sign sync batches, given ML-DSA-65's 3{,}309-byte signatures.
   \item Groups and teams later: MLS with post-quantum cipher suites.

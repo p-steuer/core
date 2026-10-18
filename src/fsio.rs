@@ -122,6 +122,41 @@ impl Dir {
         File::open(&self.path)?.sync_all()?;
         Ok(())
     }
+
+    /// A subfolder sharing this folder's crash points.
+    pub(crate) fn sub(&self, name: &str) -> Dir {
+        Dir {
+            path: self.path.join(name),
+            #[cfg(test)]
+            faults: self.faults.clone(),
+        }
+    }
+
+    /// Opens an existing file for appending.
+    pub(crate) fn open_append(&self, name: &str) -> Result<File> {
+        Ok(OpenOptions::new().append(true).open(self.file(name))?)
+    }
+
+    /// Appends `data` and flushes it to disk. A crash can leave any prefix of
+    /// `data` behind; readers treat such a torn end as never written.
+    pub(crate) fn append(&self, file: &mut File, data: &[u8]) -> Result<()> {
+        if let Err(e) = self.point() {
+            let _ = file.write_all(&data[..data.len() / 2]);
+            return Err(e);
+        }
+        file.write_all(data)?;
+        self.point()?;
+        file.sync_data()?;
+        Ok(())
+    }
+
+    /// Cuts a file back to `len` bytes and flushes it.
+    pub(crate) fn truncate(&self, file: &File, len: u64) -> Result<()> {
+        self.point()?;
+        file.set_len(len)?;
+        file.sync_data()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -200,6 +235,34 @@ mod tests {
         dir.remove("a").unwrap();
         dir.remove("a").unwrap();
         assert!(!dir.exists("a"));
+    }
+
+    #[test]
+    fn append_and_truncate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = Dir::new(tmp.path());
+        dir.write_atomic("log", b"head").unwrap();
+        let mut f = dir.open_append("log").unwrap();
+        dir.append(&mut f, b"-one").unwrap();
+        dir.append(&mut f, b"-two").unwrap();
+        assert_eq!(dir.read("log").unwrap().unwrap(), b"head-one-two");
+        dir.truncate(&f, 8).unwrap();
+        assert_eq!(dir.read("log").unwrap().unwrap(), b"head-one");
+        // Appends continue at the new end.
+        dir.append(&mut f, b"!").unwrap();
+        assert_eq!(dir.read("log").unwrap().unwrap(), b"head-one!");
+        assert_eq!(dir.sub("x").path(), tmp.path().join("x"));
+    }
+
+    #[test]
+    fn a_crash_while_appending_leaves_a_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        Dir::new(tmp.path()).write_atomic("log", b"head").unwrap();
+        let f = faults::Faults::crash_at(0);
+        let dir = Dir::with_faults(tmp.path(), f);
+        let mut file = dir.open_append("log").unwrap();
+        assert!(dir.append(&mut file, b"12345678").is_err());
+        assert_eq!(dir.read("log").unwrap().unwrap(), b"head1234");
     }
 
     #[test]

@@ -9,6 +9,7 @@ use crate::rand::TestRng;
 
 const TEST: Config = Config {
     params: TEST_PARAMS,
+    clock: Clock::System,
 };
 const NEW_PASSPHRASE: &str = "violet otter mango ladder frost";
 
@@ -35,7 +36,17 @@ fn with_recovery(path: &Path, key: &str) -> Result<Vault> {
 }
 
 fn journal_key(v: &Vault) -> [u8; 32] {
-    *v.opened().unwrap().journal_keys[0].1.as_bytes()
+    *v.opened().unwrap().journal.key.as_bytes()
+}
+
+/// Copies every file of a vault folder (not the lock).
+pub(super) fn copy_vault(from: &Path, to: &Path) {
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() && entry.file_name() != "LOCK" {
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
 }
 
 fn read(path: &Path, name: &str) -> Vec<u8> {
@@ -262,12 +273,13 @@ fn weaker_hashing_is_upgraded_at_unlock() {
             t: 3,
             p: 1,
         },
+        clock: Clock::System,
     };
     let secret = || Secret::Passphrase(passphrase::normalize(PASSPHRASE));
     let mut v = Vault::unlock_in(
         Dir::new(tmp.path()),
         secret(),
-        stronger,
+        stronger.clone(),
         &mut TestRng::new("u"),
     )
     .unwrap();
@@ -280,7 +292,7 @@ fn weaker_hashing_is_upgraded_at_unlock() {
     let again = Vault::unlock_in(
         Dir::new(tmp.path()),
         secret(),
-        stronger,
+        stronger.clone(),
         &mut TestRng::new("u"),
     )
     .unwrap();
@@ -474,9 +486,7 @@ fn a_crash_while_changing_the_passphrase_keeps_one_of_them() {
     };
     let fresh_copy = || {
         let tmp = tempfile::tempdir().unwrap();
-        for name in [KEYRING, KEYRING_BACKUP] {
-            write(tmp.path(), name, &read(template.path(), name));
-        }
+        copy_vault(template.path(), tmp.path());
         tmp
     };
 
