@@ -14,6 +14,7 @@
 \usepackage[nameinlink]{cleveref}
 
 \setlist{itemsep=2pt,topsep=4pt}
+\emergencystretch=2em
 
 % Notation
 \newcommand{\concat}{\mathbin{\|}}
@@ -30,7 +31,7 @@
 \newcommand{\todo}[1]{\textcolor{red!70!black}{[\textbf{Open:} #1]}}
 \newcommand{\dref}[1]{\textsf{#1}} % reference to the decision log in APPDESIGN.md
 
-\title{Cryptographic design of the security core\\[2pt]\large Draft 0.1}
+\title{Cryptographic design of the security core\\[2pt]\large Draft 0.2}
 \author{Internal working document}
 \date{18 October 2026}
 
@@ -38,7 +39,7 @@
 \maketitle
 
 \begin{abstract}
-This document specifies the cryptography of the app's security core (the Rust crate \texttt{secure\_core}): goals, threat model, primitives and cipher suites, the key hierarchy, data at rest, synchronisation, device pairing and sharing. It turns the decisions and proposals of the project's decision log (\texttt{APPDESIGN.md}; identifiers such as \dref{D9} or \dref{P43}) into a precise design that can be reviewed, formally analysed and implemented. Everything not yet decided is marked \todo{like this}. The app's name is deliberately absent; it lives only in the app's \texttt{branding.json} (\dref{D35}).
+This document specifies the cryptography of the app's security core (the Rust crate \texttt{secure\_core}): goals, threat model, primitives and cipher suites, the key hierarchy, data at rest, synchronisation, device pairing and sharing. Draft 0.2 adds what milestone M1 of MVP~1 implements: the libraries and parameters of suite~1, passphrase handling, the recovery key and the keyring file (\cref{sec:passphrase,sec:recovery,sec:keyring}). It turns the decisions and proposals of the project's decision log (\texttt{APPDESIGN.md}; identifiers such as \dref{D9} or \dref{P43}) into a precise design that can be reviewed, formally analysed and implemented. Everything not yet decided is marked \todo{like this}. The app's name is deliberately absent; it lives only in the app's \texttt{branding.json} (\dref{D35}).
 \end{abstract}
 
 \tableofcontents
@@ -87,19 +88,22 @@ Future quantum adversary & Breaks discrete logarithms and factoring later, appli
 
 \begin{tabularx}{\textwidth}{@{}lXl@{}}
 \toprule
-Purpose & Suite 1 (proposal, \dref{P43}, \dref{P46}) & Library \\
+Purpose & Suite 1 (\dref{P43}, \dref{P46}) & Library (\dref{D45}) \\
 \midrule
-Authenticated encryption & XChaCha20-Poly1305 (256-bit key, 192-bit random nonce) & libsodium \\
-Large files & XChaCha20-Poly1305 per chunk, see \cref{sec:blobs} & libsodium \\
-Hash, KDF & BLAKE2b (keyed, with context strings) or HKDF-SHA-256 \todo{choose} & libsodium \\
-Passphrase hashing & Argon2id, parameters per platform \todo{benchmark} & libsodium \\
-Key encapsulation & X-Wing (X25519 + ML-KEM-768) & libsodium 1.0.22 \\
-Signatures & Ed25519 \emph{and} ML-DSA-65; both must verify & libsodium, libcrux \\
-Randomness & The operating system's CSPRNG & libsodium \\
+Authenticated encryption & XChaCha20-Poly1305 (256-bit key, 192-bit random nonce) & \texttt{chacha20poly1305} 0.11.0 \\
+Large files & XChaCha20-Poly1305 per chunk, see \cref{sec:blobs} & \texttt{chacha20poly1305} 0.11.0 \\
+KDF & HKDF-SHA-256 \cite{rfc5869} with labelled info strings (\dref{P62}) & \texttt{hkdf} 0.13.0, \texttt{sha2} 0.11.1 \\
+MAC & HMAC-SHA-256 \cite{rfc2104} & \texttt{hmac} 0.13.0 \\
+Passphrase hashing & Argon2id, version 0x13, $m = 64$\,MiB, $t = 3$, $p = 4$ (\cref{sec:passphrase}) & \texttt{argon2} 0.6.0 \\
+Key encapsulation & X-Wing (X25519 + ML-KEM-768); not used before sync & later: libsodium 1.0.22 \\
+Signatures & Ed25519 \emph{and} ML-DSA-65; both must verify; not used before sync & later: libsodium, libcrux \\
+Randomness & The operating system's CSPRNG & \texttt{getrandom} 0.4.3 \\
 \bottomrule
 \end{tabularx}
 
 \medskip
+\noindent All crates are pinned to exact versions and are pure Rust; the core itself forbids \texttt{unsafe} code. MVP~1 uses RustCrypto for all of suite~1 (\dref{D45}); the post-quantum public-key parts arrive with sync and sharing.
+
 \noindent\textbf{Suite identifiers.} Every encrypted object starts with a header $h = (\mathit{format\_version}, \mathit{suite\_id}, \ldots)$ that is bound as associated data, so it can't be changed without detection.
 
 \noindent\textbf{Agility rules} (\dref{P46}):
@@ -119,47 +123,94 @@ Randomness & The operating system's CSPRNG & libsodium \\
   box/.style={draw, rounded corners, align=center, minimum width=2.9cm, minimum height=0.9cm, font=\small},
   arr/.style={-{Stealth}, thick}]
   \node[box] (pw) {passphrase $pw$\\(set at setup, \dref{D37})};
-  \node[box, right=0.6cm of pw] (rk) {recovery key $RK$\\(emergency sheet)};
-  \node[box, right=0.6cm of rk] (dk) {device keystore\\(Keychain / Keystore)};
-  \node[box, below=0.8cm of pw] (kpw) {$K_{pw} = \Argon(pw, s)$};
+  \node[box, right=0.6cm of pw] (rk) {recovery key $RK$\\(written down)};
+  \node[box, right=0.6cm of rk, dashed] (dk) {device keystore\\(later, \dref{P17})};
+  \node[box, below=0.8cm of pw] (kpw) {$K_{pw}$, $c_{pw}$\\from $\Argon$, HKDF};
+  \node[box, below=0.8cm of rk] (krk) {$K_{rk}$, $c_{rk}$\\from HKDF};
   \node[box, below=2.4cm of rk, minimum width=4cm] (mk) {master key $MK$\\(random, 256 bit)};
-  \node[box, below=1.2cm of mk, xshift=-4.4cm] (krec) {$K_{\mathrm{records}}$};
-  \node[box, right=0.3cm of krec] (kblob) {$K_{\mathrm{files}}$};
-  \node[box, right=0.3cm of kblob] (ksync) {$K_{\mathrm{sync}}$};
-  \node[box, right=0.3cm of ksync] (kid) {identity keys};
+  \node[box, below=1.2cm of mk, xshift=-3.2cm] (kkr) {$K_{\mathrm{keyring}}$, $K_{\mathrm{mac}}$};
+  \node[box, below=1.2cm of mk, xshift=2.2cm] (kj) {journal keys $K_{j,g}$\\(random, one per generation)};
   \draw[arr] (pw) -- (kpw);
-  \draw[arr] (kpw) -- node[left, font=\scriptsize, pos=0.4]{wraps} (mk);
-  \draw[arr] (rk) -- node[right, font=\scriptsize]{wraps} (mk);
-  \draw[arr] (dk) -- node[right, font=\scriptsize]{wraps (daily unlock)} (mk);
-  \draw[arr] (mk) -- (krec);
-  \draw[arr] (mk) -- (kblob);
-  \draw[arr] (mk) -- (ksync);
-  \draw[arr] (mk) -- (kid);
+  \draw[arr] (rk) -- (krk);
+  \draw[arr] (kpw) -- node[above, sloped, font=\scriptsize]{wraps} (mk);
+  \draw[arr] (krk) -- node[right, font=\scriptsize]{wraps} (mk);
+  \draw[arr, dashed] (dk.south) |- node[pos=0.25, right, font=\scriptsize]{wraps} (mk.east);
+  \draw[arr] (mk) -- node[left, font=\scriptsize]{derives} (kkr);
+  \draw[arr] (kkr) -- node[below, font=\scriptsize]{wraps} (kj);
 \end{tikzpicture}
-\caption{Key hierarchy (proposal). Arrows into $MK$ are key wrapping; arrows out of $MK$ are key derivation.}
+\caption{Key hierarchy of MVP~1. $c$ denotes a key commitment (\cref{sec:keyring}). Dashed: later.}
 \end{figure}
 
 \begin{enumerate}
-  \item \textbf{Setup} (\dref{D37}): the app generates $MK \leftarrow \{0,1\}^{256}$, asks for the passphrase $pw$ (with a strength meter and a generated suggestion, \dref{P18}) and generates the recovery key $RK \leftarrow \{0,1\}^{256}$, shown once and on the emergency sheet (\dref{P48}).
-  \item \textbf{Passphrase wrap}: $K_{pw} = \Argon(pw, s; t, m, p)$ with a random 128-bit salt $s$; $W_{pw} = \AEAD.\Enc(K_{pw}, n, MK, h)$.
-  \item \textbf{Recovery wrap}: $W_{rk} = \AEAD.\Enc(\KDF(RK, \str{recovery}), n, MK, h)$.
-  \item \textbf{Device wrap}: a non-exportable key in the OS keystore, unlocked by face, fingerprint or PIN (\dref{P9}), wraps $MK$ for daily use. \todo{exact platform APIs; Secure Enclave on iOS}
-  \item \textbf{Optional secret key} (\dref{P18}): a 256-bit device-held secret mixed into $K_{pw}$ so that a stolen backup can't be attacked with the passphrase alone. \todo{decide}
-  \item \textbf{Derived keys}: $K_x = \KDF(MK, \str{x} \concat \mathit{suite\_id})$ for $x \in \{$records, files, sync$\}$; identity key pairs are generated randomly and stored encrypted under $MK$.
-  \item \textbf{Changes}: changing the passphrase re-wraps $MK$ only. Rotating $MK$ (e.g.\ after losing a device) re-encrypts all data lazily and removes the old device from the device list.
+  \item \textbf{Setup} (\dref{D37}): the core generates $MK$, $RK$ and the first journal key $K_{j,1}$, each 256 random bits, and hashes the passphrase. Nothing is written to disk until the user has confirmed the recovery key; only then is the keyring written (\cref{sec:keyring}).
+  \item \textbf{Passphrase slot}: with a random 128-bit salt $s$,
+  \begin{align*}
+    H &= \Argon(\mathrm{norm}(pw), s; m, t, p),\\
+    K_{pw} \concat c_{pw} &= \mathrm{HKDF}\big(s, H, \str{secure\_core/v1/slot/passphrase} \concat 0 \concat \mathit{suite} \concat \mathit{vault\_id}\big),
+  \end{align*}
+  64 bytes split into a wrapping key and a commitment; $W_{pw} = \AEAD.\Enc(K_{pw}, n, MK, a_{pw})$.
+  \item \textbf{Recovery slot}: the same with $RK$ in place of $H$ and the label \str{secure\_core/v1/slot/recovery}. $RK$ is 256 random bits, so no slow hash is needed.
+  \item \textbf{Keys derived from $MK$}: $K_{\mathrm{keyring}} = \mathrm{HKDF}(\mathit{vault\_id}, MK, \str{secure\_core/v1/keyring} \concat 0 \concat \mathit{suite})$ wraps the journal keys; $K_{\mathrm{mac}}$ (label \str{secure\_core/v1/keyring/mac}) authenticates the keyring.
+  \item \textbf{Journal keys are random, not derived} (\dref{P69}): each journal generation has its own key, stored wrapped in the keyring. Compaction writes the current state under a new key and deletes the old one, so deleted and overwritten values become unreadable even if old file blocks survive on flash memory --- \emph{unless} an attacker also has the passphrase and a surviving copy of the old keyring. Full secure deletion needs a key store that can really delete, such as the hardware keystore (\dref{P17}).
+  \item \textbf{Device wrap} (\dref{P17}): later. In MVP~1 the passphrase is entered at every start (\dref{D44}).
+  \item \textbf{Changes}: a new passphrase or recovery key re-wraps $MK$ in its slot only. The old slot may survive in flash leftovers, so a changed passphrase doesn't protect against someone who knows the old one \emph{and} has such a copy; that needs a new $MK$ and re-encryption \todo{offer ``re-key everything''}.
+  \item \textbf{Optional secret key} (\dref{P18}): \todo{decide}.
 \end{enumerate}
 
-\noindent\textbf{Key handling}: keys exist only inside the core, in memory that is locked where possible and wiped after use (\texttt{zeroize}, \texttt{sodium\_memzero}); the user interface receives opaque handles.
+\noindent\textbf{Key handling (memory)}: keys exist only inside the core; the user interface receives opaque handles. Every 256-bit key is a \texttt{SecretKey} on the heap (so moves leave no stack copies) and is wiped when dropped (\texttt{zeroize}); decrypted plaintext comes back in wiped buffers. Argon2id's 64\,MiB work area is supplied by the core and wiped after each hash, because \texttt{argon2} 0.6.0's own \texttt{hash\_password\_into} frees it without wiping (its \texttt{block.rs}, checked 18 Oct 2026). \emph{Not} wiped: the copies of the passphrase and the recovery key in Dart and in the bridge's transfer buffers, zxcvbn's internal copies during the strength check, and HKDF's internal HMAC state. Memory locking (\texttt{mlock}) is not used yet.
+
+\section{Passphrases}
+\label{sec:passphrase}
+
+\begin{itemize}
+  \item \textbf{Normalisation} $\mathrm{norm}(pw)$, applied identically when setting and entering: every whitespace character becomes U+0020 (RFC 8265's OpaqueString profile maps all non-ASCII spaces this way \cite{rfc8265}); then Unicode NFC, as both RFC 8265 and NIST SP 800-63B-4 recommend \cite{sp80063b}; then spaces at the start and end are dropped, which NIST allows as a ``limited allowance for mistyping''. Case and inner spaces are kept.
+  \item \textbf{Rules} (\dref{P63}), checked by the core: 12 to 1{,}024 code points after normalisation, and a zxcvbn score of at least 3 of 4 \cite{zxcvbn} (zxcvbn evaluates the first 100 characters). NIST SP 800-63B-4 requires 15 characters for single-factor passwords \todo{12 or 15, O18}. The app shows one of ten hints (too short, common password, keyboard pattern, \ldots).
+  \item \textbf{Suggestions}: five words from EFF's long list (7{,}776 words), $\log_2 7776^5 \approx 64.6$ bits, separated by spaces, which phone keyboards type without switching layouts.
+  \item \textbf{Argon2id parameters} (\dref{P60}): $m = 64$\,MiB, $t = 3$, $p = 4$, version 0x13, 32-byte output, 16-byte salt, no secret or associated data: RFC 9106's second recommended option \cite{rfc9106}. Measured on 18 Oct 2026: 122\,ms per hash on an AMD Ryzen 5 7540U (release build, lanes computed one after another), also 122\,ms for a full unlock through the bridge. Phones: \todo{measure, only with the owner's consent}; if low-end phones take over 2\,s, $t = 2$.
+  \item \textbf{Bounds}: a keyring may only contain $19 \le m/\mathrm{MiB} \le 1024$, $2 \le t \le 10$, $1 \le p \le 8$; anything else is refused before any hashing, so a damaged or hostile file can't remove the cost or demand unbounded memory. The recovery key still opens such a vault.
+  \item \textbf{Upgrade}: if a slot's parameters are weaker than the current ones in some respect and stronger in none, a successful unlock re-wraps $MK$ with the current parameters and a new salt --- but only if the slot that opened is the newest copy's slot, so a newer passphrase change is never undone.
+\end{itemize}
+
+\section{The recovery key}
+\label{sec:recovery}
+
+$RK$ is written as 56 characters of Crockford's Base32 \cite{crockford} in 14 groups of four: a version byte (1), the 32 key bytes and a CRC-16/IBM-3740 (polynomial 0x1021, initial value 0xFFFF; check value 0x29B1 \cite{crccat}) over both, $35 \cdot 8 = 280 = 56 \cdot 5$ bits. The CRC detects every error within 16 consecutive bits, so every single wrong character and every swap of neighbouring characters, before any decryption (the tests try all of them). Input ignores case, spaces and hyphens, and reads O as 0 and I, L as 1. The version byte makes every key start with ``0''. The key for $32 \times$\texttt{0xAB} is \texttt{06NT-QAXB-NENT-\ldots-NENT-PD4T} (a golden test, computed independently).
+
+\section{The keyring}
+\label{sec:keyring}
+
+The keyring file holds the two slots and the wrapped journal keys. Format~1, little-endian:
+
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+Field & Content \\
+\midrule
+header (52 bytes) & magic \texttt{SCKEYRNG}, format (u16, 1), suite (u16, 1), $\mathit{vault\_id}$ (16), $\mathit{device\_id}$ (16), sequence number (u64, increases with every rewrite) \\
+slots & count (u8, 2), then each: type (u8). Passphrase (1): salt (16), $m$, $t$, $p$ (u32 each), commitment $c_{pw}$ (32), nonce (24), $W_{pw}$ (48). Recovery (2): salt (16), $c_{rk}$ (32), nonce (24), $W_{rk}$ (48) \\
+journal keys & count (u8, 1--8), then each: purpose (u8, 1 = journal), generation (u32), nonce (24), wrapped key (48) \\
+MAC (32) & $\mathrm{HMAC}(K_{\mathrm{mac}}, \text{everything before})$ \\
+checksum (32) & SHA-256 of everything before \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{itemize}
+  \item \textbf{Associated data}: $a_0 = \texttt{SCKEYRNG} \concat \mathit{format} \concat \mathit{suite} \concat \mathit{vault\_id}$. Passphrase slot: $a_{pw} = a_0 \concat 1 \concat s \concat m \concat t \concat p \concat c_{pw}$; recovery slot: $a_{rk} = a_0 \concat 2 \concat s \concat c_{rk}$; journal key: $a_0 \concat \mathit{purpose} \concat \mathit{generation}$. A slot copied from another vault therefore opens nowhere (tested).
+  \item \textbf{Key commitment}: XChaCha20-Poly1305 is not key-committing, so a ciphertext could be built that opens under two keys. Each slot stores a commitment derived together with its wrapping key \cite{albertini}; it is compared (in constant time) before decryption. A mismatch means ``wrong passphrase'' or ``wrong recovery key''; a match followed by a failed decryption means damage.
+  \item \textbf{MAC}: once $MK$ is known, the HMAC authenticates every byte of the file, including the device identifier and the sequence number, which no AEAD covers.
+  \item \textbf{Checksum}: unkeyed, so it protects against nothing; it only lets the app tell damage from a wrong passphrase before running Argon2id. Magic and format stay at the same offsets in every future format, so older apps can report ``made by a newer version''.
+  \item \textbf{Two copies}: \texttt{keyring} and \texttt{keyring.2}, each replaced atomically (temporary file, \texttt{fsync}, rename, \texttt{fsync} of the folder). Changes write the main copy first; from then on they count. Opening tries the copies newest first, uses the newest copy whose MAC and journal keys verify under the opened $MK$, and rewrites the other copy if it differs. Tests flip every byte of one or both copies (with the checksum fixed up, as an attacker could): with both copies changed nothing opens, with one changed the other is used and the damaged one restored.
+  \item \textbf{Crash safety}: tests simulate a crash at every step of the setup and of a passphrase change. Afterwards the setup either left no vault (and can simply be repeated) or a vault that opens with both secrets; a passphrase change leaves the old or the new passphrase working, with the same keys, and once the new one has opened the vault the old one no longer does.
+  \item \textbf{Locking}: one open vault per folder, by an in-process registry and an operating-system file lock on \texttt{LOCK}.
+\end{itemize}
+
 
 \section{Data at rest}
 \label{sec:rest}
 
 \subsection{Records}
-Each record $r$ (set, session, meal, measurement, \ldots) has a random identifier $\mathit{rid}$, a type and a version:
-\[
-c_r = \AEAD.\Enc\big(K_{\mathrm{records}},\ n \leftarrow \{0,1\}^{192},\ \mathrm{encode}(r),\ h \concat \mathit{type} \concat \mathit{rid} \concat \mathit{version}\big).
-\]
-Binding identifier, type and version as associated data prevents swapping or replaying records under another identity. \todo{storage engine: per-record AEAD in plain SQLite versus SQLCipher pages, and how local queries and analysis work on encrypted data}
+Each record (set, session, measurement, \ldots) has an identifier, a kind and flat fields. Draft 0.1 encrypted each record on its own; MVP~1 instead keeps an append-only encrypted journal of operation batches (\dref{P59}): edits and deletions are new operations, the journal is replayed into memory at unlock, and the app queries in memory. Identifiers, kinds and timestamps are inside the ciphertext. Its format, compaction (\dref{P69}) and the crash tests are specified with milestone M2 \todo{journal and blob formats, Draft 0.3}.
 
 \subsection{App settings}
 App settings (units, language, theme, timer defaults and alarms, enabled areas) describe how the app behaves, not the athlete. They are stored unencrypted on the device (\dref{D39}), which also lets the app show the right language before it is unlocked. When synced they travel inside the encrypted sync batches like any record (\dref{P58}). Anything that describes the person (profile, weight class, sports) is a record and encrypted.
@@ -213,6 +264,7 @@ Storage providers see the number, sizes and timing of encrypted files. Mitigatio
 
 \begin{itemize}
   \item \textbf{Vetted libraries} behind the suite registry: libsodium 1.0.22 (X-Wing, ML-KEM, XChaCha20-Poly1305, Argon2id, Ed25519); libcrux for ML-DSA (formally verified with hax and F*).
+  \item \textbf{Tests implemented in M1}: through the core's own wrappers, draft-irtf-cfrg-xchacha-03 A.3.1 \cite{xchacha} and all 315 Wycheproof XChaCha20-Poly1305 tests \cite{wycheproof}; RFC 9106 §5.3 (Argon2id); RFC 5869 A.1--A.3 (HKDF-SHA-256); property tests (any changed bit, associated data or nonce is rejected); a golden keyring file; the tamper and crash tests of \cref{sec:keyring}; valgrind memcheck over the test binary.
   \item \textbf{Tests} (\texttt{CLAUDE.md}): official test vectors (NIST ACVP, Wycheproof) and our own known-answer tests for every format; a regression test for every fixed bug; fuzzing of all parsers (\texttt{cargo-fuzz}); Miri for any \texttt{unsafe} code; valgrind-based constant-time checks (e.g.\ ctgrind-style) and sanitizers.
   \item \textbf{Formal analysis} of pairing, sync and sharing (ProVerif or Tamarin) before launch; machine-checked implementations where feasible.
   \item \textbf{Independent audit} of the core, reproducible builds, a public vulnerability-reporting policy.
@@ -221,9 +273,9 @@ Storage providers see the number, sizes and timing of encrypted files. Mitigatio
 \section{Open questions}
 
 \begin{enumerate}
-  \item Storage engine and how local analysis works on encrypted records (\cref{sec:rest}).
-  \item Argon2id parameters per platform, including phones and browsers with memory limits.
-  \item Encoding of the recovery key (word list or groups of characters).
+  \item Argon2id timing on real phones and in browsers with memory limits (\cref{sec:passphrase}).
+  \item The minimum passphrase length: 12 or 15 characters (\cref{sec:passphrase}).
+  \item A ``re-key everything'' action after a compromised passphrase (\cref{sec:keys}).
   \item The optional secret key (\dref{P18}).
   \item How often to sign sync batches, given ML-DSA-65's 3{,}309-byte signatures.
   \item Groups and teams later: MLS with post-quantum cipher suites.
@@ -243,6 +295,17 @@ Storage providers see the number, sizes and timing of encrypted files. Mitigatio
 \bibitem{spqr} Signal. \emph{Signal Protocol and Post-Quantum Ratchets}. Blog post, October 2025.
 \bibitem{bsi} BSI. \emph{TR-02102-1: Cryptographic Mechanisms: Recommendations and Key Lengths}. Version 2026-01.
 \bibitem{libsodium} F.~Denis. \emph{libsodium documentation}. \url{https://doc.libsodium.org}.
+\bibitem{rfc5869} H.~Krawczyk, P.~Eronen. \emph{HMAC-based Extract-and-Expand Key Derivation Function (HKDF)}. RFC 5869, 2010.
+\bibitem{rfc2104} H.~Krawczyk, M.~Bellare, R.~Canetti. \emph{HMAC: Keyed-Hashing for Message Authentication}. RFC 2104, 1997.
+\bibitem{xchacha} S.~Arciszewski. \emph{XChaCha: eXtended-nonce ChaCha and AEAD\_XChaCha20\_Poly1305}. draft-irtf-cfrg-xchacha-03, 2020.
+\bibitem{wycheproof} C2SP. \emph{Project Wycheproof}, \texttt{testvectors\_v1/xchacha20\_poly1305\_test.json}. \url{https://github.com/C2SP/wycheproof}.
+\bibitem{albertini} A.~Albertini, T.~Duong, S.~Gueron, S.~Kölbl, A.~Luykx, S.~Schmieg. \emph{How to Abuse and Fix Authenticated Encryption Without Key Commitment}. USENIX Security 2022.
+\bibitem{rfc8265} P.~Saint-Andre, A.~Melnikov. \emph{Preparation, Enforcement, and Comparison of Internationalized Strings Representing Usernames and Passwords}. RFC 8265, 2017, §4.2.
+\bibitem{sp80063b} NIST. \emph{SP 800-63B-4: Digital Identity Guidelines, Authentication and Authenticator Management}. \url{https://pages.nist.gov/800-63-4/sp800-63b.html}, section ``Password Verifiers'' (read 18 Oct 2026).
+\bibitem{zxcvbn} D.~L.~Wheeler. \emph{zxcvbn: Low-Budget Password Strength Estimation}. USENIX Security 2016.
+\bibitem{crockford} D.~Crockford. \emph{Base 32}. \url{https://www.crockford.com/base32.html}.
+\bibitem{crccat} G.~Cook. \emph{Catalogue of parametrised CRC algorithms}, CRC-16/IBM-3740. \url{https://reveng.sourceforge.io/crc-catalogue/16.htm}.
+\bibitem{eff} EFF. \emph{EFF's New Wordlists for Random Passphrases}, 2016. \url{https://www.eff.org/dice}.
 \end{thebibliography}
 
 \end{document}

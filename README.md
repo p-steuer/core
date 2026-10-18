@@ -11,3 +11,7 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
+
+- **Design:** `docs/crypto-design.tex` (build the PDF with `latexmk -pdf -outdir=build crypto-design.tex` in `docs/`).
+- **Test vectors** and their sources: `tests/vectors/README.md`. **Golden files** (`tests/golden/`) pin the file formats; rewrite them only after a deliberate format change, with `UPDATE_GOLDEN=1 cargo test golden`.
+- More commands (timing Argon2id, valgrind): `../DEVELOPMENT.md`, "Core commands".
