@@ -306,6 +306,18 @@ each frame & $\ell$ (u32), $\lnot\ell$ (u32), kind (u8, 1 = batch), $\mathit{dev
 \end{center}
 A frame is $\AEAD.\Enc(K_{j,g}, n, \mathit{batch}, \mathit{header} \concat \ell \concat \lnot\ell \concat \mathit{kind} \concat \mathit{device\_id} \concat \mathit{seq})$, so it can't be moved to another vault, generation, device or position. $\mathit{seq}$ starts at 1 in every file and increases by one. The plaintext is a JSON batch $\{\mathit{hlc}, \mathit{ops}\}$, padded with spaces to a multiple of 128 bytes, at most 1\,MiB. Operations: \emph{put} (set fields; others stay; \texttt{null} clears one), \emph{del} (a tombstone) and \emph{snap} (written by compaction, below).
 
+\noindent\textbf{Growth over decades} (measured 19 October 2026, \dref{P94}). The journal stays close to the live data thanks to compaction, but unlock replays all of it into memory. One strength session a day gives 8\,MB a year. After 10 years that means 0.6\,s more to unlock and 365\,MB of memory in the core on a desktop; after 50 years, 3.1\,s and 1.9\,GB. Two causes:
+\begin{itemize}
+  \item every field carries its own merge stamp (about 70 bytes of JSON);
+  \item the whole history is kept in memory.
+\end{itemize}
+The proposal:
+\begin{itemize}
+  \item journal format~2: one stamp per group of fields, devices as small numbers, binary batches;
+  \item archive segments per year with their own keys, decrypted on demand, with summary records in the current segment.
+\end{itemize}
+Deleting a record in an archive rewrites that segment under a new key, so crypto-shredding still holds \todo{format 2 and archive segments}.
+
 \noindent\textbf{Nonces, and no encryption in place.} ChaCha20 is a stream cipher. Encrypting two different plaintexts under the same key and nonce would reveal their XOR, and Poly1305 would then allow forgeries. That is the classic problem of data at rest rewritten in place. The core never does it:
 \begin{itemize}
   \item \textbf{Nothing is re-encrypted in place.}

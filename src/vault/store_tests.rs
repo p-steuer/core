@@ -545,3 +545,175 @@ fn edits_append_under_fresh_nonces_and_never_rewrite_earlier_bytes() {
     // The same edit twice gives unrelated ciphertexts.
     assert_ne!(bodies[bodies.len() - 1], bodies[bodies.len() - 2]);
 }
+
+/// Measures how the journal grows with years of daily logging: one strength
+/// session a day, 5 exercises × 4 sets, with the app's field names. The first
+/// year commits like the app does (57 small commits a session, whole records
+/// each time); the rest writes finished sessions in one commit each. Run in a
+/// release build:
+/// `cargo test --release --lib -- --ignored --nocapture measure_years`.
+#[test]
+#[ignore]
+fn measure_years_of_daily_sessions() {
+    use std::time::Instant;
+
+    use serde_json::{Value, json};
+
+    const DAY_MS: i64 = 86_400_000;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let journal_mb = || -> f64 {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("journal-"))
+            .map(|e| e.metadata().unwrap().len())
+            .sum::<u64>() as f64
+            / 1e6
+    };
+    let rss_mb = || -> f64 {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap();
+        let kb: f64 = s
+            .lines()
+            .find(|l| l.starts_with("VmRSS:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap()
+            .parse()
+            .unwrap();
+        kb / 1e3
+    };
+    let id = || crate::new_record_id().unwrap();
+    let rec = |kind: &str, id: &str, f: Value| put(kind, id, f);
+
+    let mut v = make(dir);
+    v.lock();
+    let t = Instant::now();
+    let mut v = unlock(dir);
+    let base_ms = t.elapsed().as_secs_f64() * 1e3;
+    let base_rss = rss_mb();
+    println!("baseline: unlock {base_ms:.0} ms (Argon2id test parameters), RSS {base_rss:.0} MB");
+
+    // One session; `app_like` commits it as the app does.
+    let session = |v: &mut Vault, day: i64, app_like: bool| {
+        let start = 1_700_000_000_000 + day * DAY_MS;
+        let s = id();
+        let session_fields = |ended: Option<i64>| json!({"started_ms": start, "tz_min": 60, "name": "Push day", "notes": null, "ended_ms": ended});
+        let mut all = vec![rec("session", &s, session_fields(None))];
+        if app_like {
+            v.commit(all.clone()).unwrap();
+        }
+        for x in 0..5i64 {
+            let e = id();
+            let entry = |started: Option<i64>, finished: Option<i64>| json!({"session": s, "exercise": "bench_press", "position": x, "started_ms": started, "finished_ms": finished, "notes": null});
+            let set = |o: i64, reps: Option<i64>, done: Option<i64>, rest: Option<i64>| {
+                json!({"entry": e, "order": o, "weight_g": 100_000, "target_reps": 5,
+                       "rest_planned_s": 120, "predict_1rm": o == 0, "reps": reps,
+                       "done_ms": done, "rest_taken_s": rest, "notes": null})
+            };
+            let sets: Vec<String> = (0..4).map(|_| id()).collect();
+            let t0 = start + x * 900_000;
+            if app_like {
+                v.commit(vec![rec("exercise_entry", &e, entry(None, None))])
+                    .unwrap();
+                v.commit(
+                    sets.iter()
+                        .enumerate()
+                        .map(|(o, sid)| rec("set", sid, set(o as i64, None, None, None)))
+                        .collect(),
+                )
+                .unwrap();
+                v.commit(vec![rec("exercise_entry", &e, entry(Some(t0), None))])
+                    .unwrap();
+                for (o, sid) in sets.iter().enumerate() {
+                    let done = t0 + o as i64 * 150_000;
+                    v.commit(vec![rec(
+                        "set",
+                        sid,
+                        set(o as i64, Some(5), Some(done), None),
+                    )])
+                    .unwrap();
+                    if o < 3 {
+                        v.commit(vec![rec(
+                            "set",
+                            sid,
+                            set(o as i64, Some(5), Some(done), Some(120)),
+                        )])
+                        .unwrap();
+                    }
+                }
+                v.commit(vec![rec(
+                    "exercise_entry",
+                    &e,
+                    entry(Some(t0), Some(t0 + 600_000)),
+                )])
+                .unwrap();
+            } else {
+                all.push(rec(
+                    "exercise_entry",
+                    &e,
+                    entry(Some(t0), Some(t0 + 600_000)),
+                ));
+                for (o, sid) in sets.iter().enumerate() {
+                    let done = t0 + o as i64 * 150_000;
+                    let rest = (o < 3).then_some(120);
+                    all.push(rec("set", sid, set(o as i64, Some(5), Some(done), rest)));
+                }
+            }
+        }
+        if app_like {
+            v.commit(vec![rec(
+                "session",
+                &s,
+                session_fields(Some(start + 4_500_000)),
+            )])
+            .unwrap();
+        } else {
+            all[0] = rec("session", &s, session_fields(Some(start + 4_500_000)));
+            v.commit(all).unwrap();
+        }
+    };
+    // Compaction runs only when it's due; a deletion makes it due.
+    let compact = |v: &mut Vault| {
+        v.commit(vec![put("weight", "probe", json!({"weight_g": 1}))])
+            .unwrap();
+        v.commit(vec![del("weight", "probe")]).unwrap();
+        let t = Instant::now();
+        v.compact().unwrap();
+        t.elapsed().as_secs_f64()
+    };
+
+    let mut day = 0i64;
+    let t = Instant::now();
+    while day < 365 {
+        session(&mut v, day, true);
+        day += 1;
+    }
+    let raw = journal_mb();
+    println!(
+        "year 1, as the app commits ({:.0} s): journal {raw:.2} MB before compaction, due: {}",
+        t.elapsed().as_secs_f64(),
+        v.needs_compaction()
+    );
+    let secs = compact(&mut v);
+    println!("  after compaction ({secs:.2} s): {:.2} MB", journal_mb());
+
+    println!(
+        "years | sessions | journal MB | compaction s | unlock ms (minus Argon2id) | RSS MB open"
+    );
+    for years in [1i64, 5, 10, 25, 50] {
+        while day < years * 365 {
+            session(&mut v, day, false);
+            day += 1;
+        }
+        let secs = compact(&mut v);
+        let open_rss = rss_mb() - base_rss;
+        v.lock();
+        let t = Instant::now();
+        v = unlock(dir);
+        let ms = t.elapsed().as_secs_f64() * 1e3 - base_ms;
+        println!(
+            "{years:5} | {day:8} | {:10.1} | {secs:12.2} | {ms:26.0} | {open_rss:11.0}",
+            journal_mb()
+        );
+    }
+}
