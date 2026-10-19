@@ -31,7 +31,7 @@
 \newcommand{\todo}[1]{\textcolor{red!70!black}{[\textbf{Open:} #1]}}
 \newcommand{\dref}[1]{\textsf{#1}} % reference to the decision log in APPDESIGN.md
 
-\title{Cryptographic design of the security core\\[2pt]\large Draft 0.3}
+\title{Cryptographic design of the security core\\[2pt]\large Draft 0.4}
 \author{Internal working document}
 \date{18 October 2026}
 
@@ -39,7 +39,7 @@
 \maketitle
 
 \begin{abstract}
-This document specifies the cryptography of the app's security core (the Rust crate \texttt{secure\_core}): goals, threat model, primitives and cipher suites, the key hierarchy, data at rest, synchronisation, device pairing and sharing. Draft 0.2 added what milestone M1 of MVP~1 implements: the libraries and parameters of suite~1, passphrase handling, the recovery key and the keyring file (\cref{sec:passphrase,sec:recovery,sec:keyring}). Draft 0.3 adds milestone M2: the journal, merging, compaction and encrypted files (\cref{sec:rest}). It turns the decisions and proposals of the project's decision log (\texttt{APPDESIGN.md}; identifiers such as \dref{D9} or \dref{P43}) into a precise design that can be reviewed, formally analysed and implemented. Everything not yet decided is marked \todo{like this}. The app's name is deliberately absent; it lives only in the app's \texttt{branding.json} (\dref{D35}).
+This document specifies the cryptography of the app's security core (the Rust crate \texttt{secure\_core}): goals, threat model, primitives and cipher suites, the key hierarchy, data at rest, synchronisation, device pairing and sharing. Draft 0.2 added what milestone M1 of MVP~1 implements: the libraries and parameters of suite~1, passphrase handling, the recovery key and the keyring file (\cref{sec:passphrase,sec:recovery,sec:keyring}). Draft 0.3 adds milestone M2: the journal, merging, compaction and encrypted files (\cref{sec:rest}). Draft 0.4 adds the hardening of milestone M8: what the finished app writes and logs, platform backups, and the assurance checks (\cref{sec:ondisk,sec:assurance}). It turns the decisions and proposals of the project's decision log (\texttt{APPDESIGN.md}; identifiers such as \dref{D9} or \dref{P43}) into a precise design that can be reviewed, formally analysed and implemented. Everything not yet decided is marked \todo{like this}. The app's name is deliberately absent; it lives only in the app's \texttt{branding.json} (\dref{D35}).
 \end{abstract}
 
 \tableofcontents
@@ -247,7 +247,12 @@ App settings (units, language, theme, timer defaults and alarms, enabled areas) 
 Each file has a random identifier $\mathit{fid}$ (128 bits) and its own random key $K_f$, kept in a core-internal record of the journal (invisible to the app), so deleting the file's record and compacting destroys the key like any other value. File format~1, \texttt{blobs/}$\mathit{fid}$\texttt{.blob}: a 64-byte header (magic \texttt{SCBLOBFL}, format, suite, $\mathit{vault\_id}$, $\mathit{fid}$, chunk size, a random 16-byte nonce prefix $p$), then the file in chunks of 64\,KiB; chunk $i$ is $\AEAD.\Enc(K_f, p \concat i_{\mathrm{BE64}}, \mathit{chunk}_i, \mathit{header} \concat i \concat \mathit{is\_last})$, all full-size except the last; an empty file is one empty last chunk. Chunks can be decrypted on their own (seeking in videos later, \dref{P34}) while reordering, truncation, appending and moving to another vault or file are detected (tested). The file is written atomically before its key is committed; unlock removes files without a key (left by a crash in between). Photos are re-encoded by the app before storing, which removes location and other metadata (\dref{D43}).
 
 \subsection{What is on disk}
+\label{sec:ondisk}
 The vault folder holds \texttt{LOCK}, \texttt{keyring}, \texttt{keyring.2}, one \texttt{journal-}$g$\texttt{.log} and \texttt{blobs/}. A test fills a vault with marked values (a name, notes, a photo), compacts, writes more, and searches every file for the markers and for field and kind names: none appears.
+
+The same holds for the finished app (M8). Its end-to-end test runs setup, logging, two passphrase changes, a new recovery key and a recovery through the real core, then writes a marked name and notes. It searches every file the app wrote (the vault and \texttt{settings.json}) for the marker, all three passphrases, both recovery keys and the field names, in UTF-8 and UTF-16: none appears. \texttt{settings.json} holds exactly its six keys, and neither the app's own log nor the Android system log contains any of the secrets.
+
+\paragraph{Platform backups.} On Android the app opts out of cloud backup and of device-to-device transfer (\dref{D52}). It sets \texttt{allowBackup="false"} and adds rules that exclude every storage domain, for Android~12 and later and for Android~11 and earlier, because \texttt{allowBackup} alone doesn't stop device-to-device transfers on all devices for apps targeting Android~12. The encrypted vault would be safe in a backup; the point is that nothing leaves the device without the user's action. A release check verifies the merged manifest, and that the app holds no \texttt{INTERNET} permission. \todo{iOS: exclude the vault from iCloud and device backups (\texttt{isExcludedFromBackup}), \dref{O9}}
 
 \section{Synchronisation}
 \label{sec:sync}
@@ -291,9 +296,11 @@ The core runs as WebAssembly. Keys live only in memory for the session; a persis
 Storage providers see the number, sizes and timing of encrypted files. Mitigations: random file names, padding of records and batches to size buckets, batching of writes. \todo{choose bucket sizes; measure the overhead}
 
 \section{Implementation and assurance}
+\label{sec:assurance}
 
 \begin{itemize}
-  \item \textbf{Vetted libraries} behind the suite registry: libsodium 1.0.22 (X-Wing, ML-KEM, XChaCha20-Poly1305, Argon2id, Ed25519); libcrux for ML-DSA (formally verified with hax and F*).
+  \item \textbf{Vetted libraries} behind the suite registry: RustCrypto for all of suite~1 in MVP~1 (\dref{D45}), pinned to exact versions; for the public-key parts that arrive with sync and sharing, libsodium (X-Wing, ML-KEM, Ed25519) and libcrux for ML-DSA (formally verified with hax and F*).
+  \item \textbf{Checks implemented in M8}: \texttt{cargo deny} over both crates (known vulnerabilities in the RustSec database, licences, duplicate and wildcard dependencies, sources: only crates.io); test coverage of the core, 96.8\,\% of lines; the app-level search of \cref{sec:ondisk}; a release check of the Android package (permissions, backup, debuggable, 16\,KB page alignment); the licences of all 105 compiled crates on the app's licence page.
   \item \textbf{Tests implemented in M2}: journal truncation at every byte, every flipped bit of a frame, gaps, repetitions and frames of other vaults, generations or devices; a golden journal file; merge property tests; crash points at every step of commits, compaction and storing files; the plaintext search of the previous section.
   \item \textbf{Tests implemented in M1}: through the core's own wrappers, draft-irtf-cfrg-xchacha-03 A.3.1 \cite{xchacha} and all 315 Wycheproof XChaCha20-Poly1305 tests \cite{wycheproof}; RFC 9106 §5.3 (Argon2id); RFC 5869 A.1--A.3 (HKDF-SHA-256); property tests (any changed bit, associated data or nonce is rejected); a golden keyring file; the tamper and crash tests of \cref{sec:keyring}; valgrind memcheck over the test binary.
   \item \textbf{Tests} (\texttt{CLAUDE.md}): official test vectors (NIST ACVP, Wycheproof) and our own known-answer tests for every format; a regression test for every fixed bug; fuzzing of all parsers (\texttt{cargo-fuzz}); Miri for any \texttt{unsafe} code; valgrind-based constant-time checks (e.g.\ ctgrind-style) and sanitizers.
