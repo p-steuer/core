@@ -508,3 +508,40 @@ fn no_plaintext_reaches_the_disk() {
         }
     }
 }
+
+/// An edit never re-encrypts what is already on disk (crypto design,
+/// "Nonces"): a commit appends a frame under a fresh random nonce, so no key
+/// and nonce ever encrypt two different plaintexts. With a stream cipher such
+/// as ChaCha20 that would reveal their XOR.
+#[test]
+fn edits_append_under_fresh_nonces_and_never_rewrite_earlier_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = make(tmp.path());
+    let path = tmp.path().join(journal_name(&v));
+    v.commit(vec![put("set", "a", json!({"reps": 5}))]).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    for _ in 0..2 {
+        v.commit(vec![put("set", "a", json!({"reps": 6}))]).unwrap();
+    }
+    let after = std::fs::read(&path).unwrap();
+    assert_eq!(&after[..before.len()], &before[..], "earlier bytes changed");
+
+    // Journal format 1: length, its complement, kind, device, seq, nonce,
+    // ciphertext.
+    let (mut pos, mut nonces, mut bodies) = (journal::HEADER_LEN, Vec::new(), Vec::new());
+    while pos < after.len() {
+        let len = u32::from_le_bytes(after[pos..pos + 4].try_into().unwrap()) as usize;
+        let nonce = pos + 8 + 1 + 16 + 8;
+        nonces.push(after[nonce..nonce + 24].to_vec());
+        bodies.push(after[nonce + 24..pos + 8 + len].to_vec());
+        pos += 8 + len;
+    }
+    assert_eq!(pos, after.len());
+    assert!(nonces.len() >= 3);
+    let mut unique = nonces.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), nonces.len(), "a nonce repeated");
+    // The same edit twice gives unrelated ciphertexts.
+    assert_ne!(bodies[bodies.len() - 1], bodies[bodies.len() - 2]);
+}

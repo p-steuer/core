@@ -306,6 +306,23 @@ each frame & $\ell$ (u32), $\lnot\ell$ (u32), kind (u8, 1 = batch), $\mathit{dev
 \end{center}
 A frame is $\AEAD.\Enc(K_{j,g}, n, \mathit{batch}, \mathit{header} \concat \ell \concat \lnot\ell \concat \mathit{kind} \concat \mathit{device\_id} \concat \mathit{seq})$, so it can't be moved to another vault, generation, device or position. $\mathit{seq}$ starts at 1 in every file and increases by one. The plaintext is a JSON batch $\{\mathit{hlc}, \mathit{ops}\}$, padded with spaces to a multiple of 128 bytes, at most 1\,MiB. Operations: \emph{put} (set fields; others stay; \texttt{null} clears one), \emph{del} (a tombstone) and \emph{snap} (written by compaction, below).
 
+\noindent\textbf{Nonces, and no encryption in place.} ChaCha20 is a stream cipher. Encrypting two different plaintexts under the same key and nonce would reveal their XOR, and Poly1305 would then allow forgeries. That is the classic problem of data at rest rewritten in place. The core never does it:
+\begin{itemize}
+  \item \textbf{Nothing is re-encrypted in place.}
+  \begin{itemize}
+    \item The journal only appends: an edit is a new frame, and compaction writes a new file under a new key.
+    \item The keyring and the encrypted files are replaced as whole files and sealed again with fresh nonces.
+  \end{itemize}
+  \item \textbf{Every encryption draws a fresh random 192-bit nonce} from the operating system. A file's chunks use a random 128-bit prefix plus the chunk's index.
+  \begin{itemize}
+    \item With 192 bits, random nonces are safe: $n$ encryptions under one key repeat a nonce with a probability below $n^2/2^{193}$, i.e.\ $2^{-97}$ for $2^{48}$ frames.
+    \item There are no counters, which a crash, a restored backup or a vault copied to two devices could repeat.
+  \end{itemize}
+  \item \textbf{Keys are short-lived:} one per journal generation, one per file, one per sealed container (\cref{sec:sealed}). Even a repeated nonce would stay within one key's lifetime.
+  \item \textbf{Identical ciphertexts appear only where nothing changed,} e.g.\ the two keyring copies, or a slot carried over unchanged. They reveal just that.
+\end{itemize}
+Disk encryption needs XTS or wide-block modes because a sector has no room for a nonce and a tag; our frames carry both (40 bytes), so a randomized AEAD fits. An observer of successive versions (the user's cloud, two forensic images) still learns sizes (padded to 128 bytes), when and how many frames were added, and which files exist. Tests check that edits only append, that no frame repeats a nonce, and that a file sealed twice gets fresh nonces.
+
 \noindent\textbf{Commit}: validate everything first; encrypt the batch; append it in one write and \texttt{fsync} it; only then apply it in memory. If the append fails, the partial frame is cut off again; if even that fails, the vault refuses further changes until it is reopened, because a new frame behind garbage would look like damage.
 
 \noindent\textbf{Reading}: a crash can leave only an unfinished or garbled \emph{last} frame (a prefix of the append, or zeros where the file grew but the data didn't arrive). That is a \emph{torn end}: it is cut off and reported (\texttt{recovered\_journal}). Anything wrong before the last frame --- a frame that doesn't decrypt, a sequence gap or repetition, a frame of another device --- is \emph{damage}: the vault opens read-only with the batches before it, and nothing is deleted. The complement $\lnot\ell$ keeps the two apart: without it, one flipped bit in an early frame's length could make all later frames look like one unfinished last frame, and they would be cut off. With it, every single-bit change before the last frame is reported as damage (tested for every bit of a frame). Dropping whole frames at the end can't be detected locally (no rollback protection on one device).

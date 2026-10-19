@@ -228,4 +228,19 @@ mod tests {
             assert!(open(&key(), 1, &VAULT, &ID, &b).is_err(), "byte {i}");
         }
     }
+
+    /// The same file sealed twice, even under the same key, gets a fresh
+    /// nonce prefix, so no key and nonce repeat. (Each file also has a key of
+    /// its own; this is the second line of defence.)
+    #[test]
+    fn the_same_file_twice_gets_fresh_nonces() {
+        let d = data(100_000);
+        let a = seal(&key(), 1, &VAULT, &ID, &d, &mut TestRng::new("first")).unwrap();
+        let b = seal(&key(), 1, &VAULT, &ID, &d, &mut TestRng::new("second")).unwrap();
+        assert_ne!(
+            a[HEADER_LEN - 16..HEADER_LEN],
+            b[HEADER_LEN - 16..HEADER_LEN]
+        );
+        assert_ne!(a[HEADER_LEN..], b[HEADER_LEN..]);
+    }
 }
