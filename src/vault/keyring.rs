@@ -44,7 +44,7 @@ const CHECKSUM_LEN: usize = 32;
 
 type Wrapped = [u8; 48];
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Keyring {
     pub suite: u16,
     pub vault_id: [u8; 16],
@@ -57,7 +57,7 @@ pub(crate) struct Keyring {
     pub mac: [u8; MAC_LEN],
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PassphraseSlot {
     pub salt: [u8; 16],
     pub params: Params,
@@ -66,7 +66,7 @@ pub(crate) struct PassphraseSlot {
     pub wrapped: Wrapped,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct RecoverySlot {
     pub salt: [u8; 16],
     pub commitment: [u8; 32],
@@ -74,12 +74,49 @@ pub(crate) struct RecoverySlot {
     pub wrapped: Wrapped,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct WrappedKey {
     pub purpose: u8,
     pub generation: u32,
     pub nonce: Nonce,
     pub wrapped: Wrapped,
+}
+
+// Debug never shows salts, commitments or wrapped keys (security review
+// L2): a commitment lets anyone check passphrase guesses offline.
+impl std::fmt::Debug for Keyring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Keyring")
+            .field("suite", &self.suite)
+            .field("seq", &self.seq)
+            .field("passphrase", &self.passphrase)
+            .field("recovery", &self.recovery)
+            .field("data_keys", &self.data_keys)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for PassphraseSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PassphraseSlot")
+            .field("params", &self.params)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for RecoverySlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoverySlot").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for WrappedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WrappedKey")
+            .field("purpose", &self.purpose)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Associated data shared by everything wrapped in a keyring.

@@ -16,20 +16,44 @@ use serde::de::{self, SeqAccess, Visitor};
 use serde::ser::SerializeTuple;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
+use zeroize::Zeroize;
 
 use crate::{Error, Result};
 
+/// Overwrites a text value before its memory is freed: record texts and the
+/// core's file keys (security review L2). Numbers can't be wiped this way.
+fn wipe(value: &mut Value) {
+    if let Value::String(s) = value {
+        s.zeroize();
+    }
+}
+
+/// Field values are the user's data or keys, so `Debug` shows names only.
+fn field_names<'a>(names: impl Iterator<Item = &'a String>) -> Vec<&'a str> {
+    names.map(String::as_str).collect()
+}
+
 /// A record as the app sees it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Record {
     pub kind: String,
     pub id: String,
     pub fields: Map<String, Value>,
 }
 
+impl std::fmt::Debug for Record {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Record")
+            .field("kind", &self.kind)
+            .field("id", &self.id)
+            .field("fields", &field_names(self.fields.keys()))
+            .finish()
+    }
+}
+
 /// A change the app commits. A put sets the given fields and keeps all
 /// others; a field set to `null` is cleared.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum Change {
     Put {
         kind: String,
@@ -40,6 +64,24 @@ pub enum Change {
         kind: String,
         id: String,
     },
+}
+
+impl std::fmt::Debug for Change {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Change::Put { kind, id, fields } => f
+                .debug_struct("Put")
+                .field("kind", kind)
+                .field("id", id)
+                .field("fields", &field_names(fields.keys()))
+                .finish(),
+            Change::Delete { kind, id } => f
+                .debug_struct("Delete")
+                .field("kind", kind)
+                .field("id", id)
+                .finish(),
+        }
+    }
 }
 
 pub(crate) const MAX_STRING_BYTES: usize = 64 * 1024;
@@ -172,7 +214,7 @@ pub(crate) fn unhex16(s: &str) -> Option<[u8; 16]> {
 }
 
 /// One operation inside a batch.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase", deny_unknown_fields)]
 pub(crate) enum Op {
     Put {
@@ -194,6 +236,42 @@ pub(crate) enum Op {
     },
 }
 
+impl Drop for Op {
+    fn drop(&mut self) {
+        match self {
+            Op::Put { fields, .. } => fields.values_mut().for_each(wipe),
+            Op::Del { .. } => {}
+            Op::Snap { fields, .. } => fields.iter_mut().for_each(|(_, _, v)| wipe(v)),
+        }
+    }
+}
+
+impl std::fmt::Debug for Op {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Op::Put { kind, id, fields } => f
+                .debug_struct("Put")
+                .field("kind", kind)
+                .field("id", id)
+                .field("fields", &field_names(fields.keys()))
+                .finish(),
+            Op::Del { kind, id } => f
+                .debug_struct("Del")
+                .field("kind", kind)
+                .field("id", id)
+                .finish(),
+            Op::Snap {
+                kind, id, fields, ..
+            } => f
+                .debug_struct("Snap")
+                .field("kind", kind)
+                .field("id", id)
+                .field("fields", &field_names(fields.iter().map(|(n, _, _)| n)))
+                .finish(),
+        }
+    }
+}
+
 /// What one journal frame holds.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -211,13 +289,29 @@ impl From<Change> for Op {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub(crate) struct RecordState {
     /// The latest put or snapshot.
     alive: Option<Stamp>,
     /// The latest deletion.
     deleted: Option<Stamp>,
     fields: BTreeMap<String, (Stamp, Value)>,
+}
+
+impl Drop for RecordState {
+    fn drop(&mut self) {
+        self.fields.values_mut().for_each(|(_, v)| wipe(v));
+    }
+}
+
+impl std::fmt::Debug for RecordState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordState")
+            .field("alive", &self.alive)
+            .field("deleted", &self.deleted)
+            .field("fields", &field_names(self.fields.keys()))
+            .finish()
+    }
 }
 
 impl RecordState {
@@ -247,13 +341,24 @@ impl RecordState {
     }
 }
 
-/// All records in memory, rebuilt from the journal at unlock.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// All records in memory, rebuilt from the journal at unlock. Dropping it
+/// (when the vault locks) wipes the texts.
+#[derive(Clone, Default, PartialEq)]
 pub(crate) struct Store {
     records: BTreeMap<(String, String), RecordState>,
     /// Field writes since the last compaction, for deciding when to compact.
     writes: u64,
     deletes: u64,
+}
+
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Store")
+            .field("records", &self.records.len())
+            .field("writes", &self.writes)
+            .field("deletes", &self.deletes)
+            .finish()
+    }
 }
 
 impl Store {
@@ -328,6 +433,35 @@ impl Store {
                 .map(|(n, _, v)| (n.clone(), v.clone()))
                 .collect(),
         })
+    }
+
+    /// Whether a visible record exists, without copying it.
+    pub(crate) fn exists(&self, kind: &str, id: &str) -> bool {
+        self.records
+            .get(&(kind.to_owned(), id.to_owned()))
+            .is_some_and(RecordState::visible)
+    }
+
+    /// One visible text field, borrowed rather than copied (for the core's
+    /// file keys, which shouldn't be duplicated in memory).
+    pub(crate) fn field_str(&self, kind: &str, id: &str, field: &str) -> Option<&str> {
+        let r = self.records.get(&(kind.to_owned(), id.to_owned()))?;
+        if !r.visible() {
+            return None;
+        }
+        r.visible_fields()
+            .find(|(n, _, _)| n.as_str() == field)
+            .and_then(|(_, _, v)| v.as_str())
+    }
+
+    /// The ids of the visible records of one kind, sorted.
+    pub(crate) fn ids(&self, kind: &str) -> Vec<String> {
+        self.records
+            .range((kind.to_owned(), String::new())..)
+            .take_while(|((k, _), _)| k == kind)
+            .filter(|(_, r)| r.visible())
+            .map(|((_, id), _)| id.clone())
+            .collect()
     }
 
     /// The highest clock value of any write, so new writes come after it.

@@ -38,8 +38,10 @@ impl Dir {
         self.path.join(name)
     }
 
-    pub(crate) fn exists(&self, name: &str) -> bool {
-        self.file(name).exists()
+    /// Whether `name` exists. An error (e.g. no permission to look) is
+    /// reported, never taken as "no": callers decide destructive steps on it.
+    pub(crate) fn exists(&self, name: &str) -> Result<bool> {
+        Ok(self.file(name).try_exists()?)
     }
 
     /// A crash point: in tests, may simulate a crash here.
@@ -61,9 +63,42 @@ impl Dir {
         }
     }
 
+    /// Creates the folder (readable only by the owner on Unix) and makes its
+    /// entry in the parent folder durable.
     pub(crate) fn create_dir(&self) -> Result<()> {
-        fs::create_dir_all(&self.path)?;
+        if self.path.try_exists()? {
+            return Ok(());
+        }
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&self.path)?;
+        if let Some(parent) = self.path.parent() {
+            File::open(parent)?.sync_all()?;
+            #[cfg(test)]
+            if let Some(f) = &self.faults {
+                f.note_parent_sync();
+            }
+        }
         Ok(())
+    }
+
+    /// Restricts the folder and its files to the owner (Unix; elsewhere the
+    /// app's own storage is private already). For folders made before the
+    /// modes were set; best effort.
+    pub(crate) fn restrict_to_owner(&self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(0o700));
+            if let Ok(names) = self.list() {
+                for name in names {
+                    let _ =
+                        fs::set_permissions(self.file(&name), fs::Permissions::from_mode(0o600));
+                }
+            }
+        }
     }
 
     /// Replaces `name` with `data` so that after a crash the file holds
@@ -72,11 +107,11 @@ impl Dir {
     pub(crate) fn write_atomic(&self, name: &str, data: &[u8]) -> Result<()> {
         let tmp = self.file(&format!("{name}.tmp"));
         self.point()?;
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut f = options.open(&tmp)?;
         if let Err(e) = self.point() {
             // A crash in the middle of writing leaves a torn temporary file.
             let _ = f.write_all(&data[..data.len() / 2]);
@@ -175,6 +210,7 @@ pub(crate) mod faults {
         crash_at: Option<usize>,
         passed: usize,
         crashed: bool,
+        parent_syncs: usize,
     }
 
     impl Faults {
@@ -184,6 +220,7 @@ pub(crate) mod faults {
                     crash_at: Some(n),
                     passed: 0,
                     crashed: false,
+                    parent_syncs: 0,
                 }),
             })
         }
@@ -195,6 +232,7 @@ pub(crate) mod faults {
                     crash_at: None,
                     passed: 0,
                     crashed: false,
+                    parent_syncs: 0,
                 }),
             })
         }
@@ -205,6 +243,15 @@ pub(crate) mod faults {
 
         pub(crate) fn crashed(&self) -> bool {
             self.state.lock().unwrap().crashed
+        }
+
+        /// How often a new folder's parent was flushed.
+        pub(crate) fn parent_syncs(&self) -> usize {
+            self.state.lock().unwrap().parent_syncs
+        }
+
+        pub(crate) fn note_parent_sync(&self) {
+            self.state.lock().unwrap().parent_syncs += 1;
         }
 
         pub(crate) fn point(&self) -> Result<()> {
@@ -234,7 +281,73 @@ mod tests {
         assert_eq!(dir.read("missing").unwrap(), None);
         dir.remove("a").unwrap();
         dir.remove("a").unwrap();
-        assert!(!dir.exists("a"));
+        assert!(!dir.exists("a").unwrap());
+    }
+
+    // Regression (19 Oct 2026, security review L7): `exists` was
+    // `Path::exists`, which says "no" on any error, and setup deletes
+    // leftovers when no keyring "exists".
+    #[cfg(unix)]
+    #[test]
+    fn exists_reports_errors_instead_of_no() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let locked = tmp.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("keyring"), b"x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = Dir::new(&locked).exists("keyring");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // (Running as root would bypass the permission check.)
+        if !is_root() {
+            assert!(result.is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    fn is_root() -> bool {
+        std::fs::read_to_string("/proc/self/status")
+            .map(|s| {
+                s.lines()
+                    .any(|l| l.starts_with("Uid:") && l.split_whitespace().nth(1) == Some("0"))
+            })
+            .unwrap_or(false)
+    }
+
+    // Regression (19 Oct 2026, security review L9): a new folder's entry in
+    // its parent wasn't flushed, so a power cut could lose the folder.
+    #[test]
+    fn a_new_folder_is_made_durable_in_its_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let faults = faults::Faults::counting();
+        let dir = Dir::with_faults(tmp.path().join("vault"), faults.clone());
+        dir.create_dir().unwrap();
+        assert_eq!(faults.parent_syncs(), 1);
+        dir.create_dir().unwrap();
+        assert_eq!(faults.parent_syncs(), 1, "an existing folder needs nothing");
+    }
+
+    // Regression (19 Oct 2026, security review L8): on Linux the vault folder
+    // and its files got the default modes (0755 / 0644), readable by other
+    // local users.
+    #[cfg(unix)]
+    #[test]
+    fn folders_and_files_are_for_the_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = Dir::new(tmp.path().join("vault"));
+        dir.create_dir().unwrap();
+        dir.write_atomic("keyring", b"secret").unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(dir.path()), 0o700);
+        assert_eq!(mode(&dir.file("keyring")), 0o600);
+        // An older folder with loose modes is tightened.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(dir.file("keyring"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        dir.restrict_to_owner();
+        assert_eq!(mode(dir.path()), 0o700);
+        assert_eq!(mode(&dir.file("keyring")), 0o600);
     }
 
     #[test]

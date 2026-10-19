@@ -43,11 +43,11 @@ impl VaultLock {
     }
 
     fn os_lock(dir: &Dir) -> Result<File> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.file("LOCK"))?;
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options.open(dir.file("LOCK"))?;
         match file.try_lock() {
             Ok(()) => Ok(file),
             Err(TryLockError::WouldBlock) => Err(Error::InUse),
