@@ -74,7 +74,7 @@ This document specifies the cryptography of the app's security core (the Rust cr
 \toprule
 Adversary & Capabilities and what the design must achieve \\
 \midrule
-Thief of a locked device & Has the device's storage. Must not get data without the device unlock (OS keystore) or the passphrase; offline guessing is slowed by Argon2id (\cref{sec:keys}). \\
+Thief of a locked device & Has the device's storage. Must not get data without the device unlock (OS keystore) or the passphrase; offline guessing is slowed by Argon2id (\cref{sec:keys}) and, as proposed, bound to the device (\cref{sec:offline}). \\
 Storage provider & The user's cloud or server (\dref{D15}): reads, deletes, reorders or replays files, serves old versions. Gets only ciphertext; forgery and rollback are detected (G2, G3). \\
 Network attacker & Reads and changes traffic during sync and pairing. Must learn nothing and be unable to impersonate a device. \\
 Share recipient & Gets what was shared, and may try to escalate (read more, write without permission) or to impersonate the owner. \\
@@ -175,6 +175,86 @@ Randomness & The operating system's CSPRNG & \texttt{getrandom} 0.4.3 \\
 \label{sec:recovery}
 
 $RK$ is written as 56 characters of Crockford's Base32 \cite{crockford} in 14 groups of four: a version byte (1), the 32 key bytes and a CRC-16/IBM-3740 (polynomial 0x1021, initial value 0xFFFF; check value 0x29B1 \cite{crccat}) over both, $35 \cdot 8 = 280 = 56 \cdot 5$ bits. The CRC detects every error within 16 consecutive bits, so every single wrong character and every swap of neighbouring characters, before any decryption (the tests try all of them). Input ignores case, spaces and hyphens, and reads O as 0 and I, L as 1. The version byte makes every key start with ``0''. The key for $32 \times$\texttt{0xAB} is \texttt{06NT-QAXB-NENT-\ldots-NENT-PD4T} (a golden test, computed independently).
+
+\section{Offline guessing}
+\label{sec:offline}
+\emph{Research of 19 October 2026; proposal \dref{P85}.} Whoever holds a copy of the keyring can guess passphrases offline. Such copies include:
+\begin{itemize}
+  \item a forensic image of a phone taken after its first unlock (Android keeps the file keys in memory from then on, and so does iOS for its default class \cite{jhu2021});
+  \item a stolen backup;
+  \item a synced copy in the user's cloud.
+\end{itemize}
+Argon2id only multiplies the cost of each guess.
+
+\paragraph{Attack cost.} hashcat~7.0 measures 1{,}703 Argon2id guesses per second on one RTX~4090 at RFC~9106's second recommended setting with $p = 1$ \cite{hashcat7}. Ours uses $p = 4$ with the same memory and passes, and we assume that costs an attacker about the same (not measured). At \$0.34 per rented GPU hour that is about \$$5.5 \times 10^{-8}$ per guess; dedicated hardware may be 10 to 100 times cheaper (an assumption). zxcvbn's score~3, the gate of \cref{sec:passphrase}, means fewer than $10^{10}$ guesses \cite{zxcvbn}.
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}Xllll@{}}
+\toprule
+Secret & Guesses & One GPU, all & Average cost & 1{,}000 GPUs, average \\
+\midrule
+zxcvbn score 3 (upper bound) & $10^{10}$ & 68 days & \$280 & 49 minutes \\
+40 bits & $1.1 \times 10^{12}$ & 20 years & \$30{,}000 & 3.7 days \\
+50 bits & $1.1 \times 10^{15}$ & 21{,}000 years & \$31 million & 10 years \\
+60 bits & $1.2 \times 10^{18}$ & 21 million years & \$32 billion & 11{,}000 years \\
+5 EFF words (64.6 bits) & $2.8 \times 10^{19}$ & 520 million years & \$0.78 trillion & 260{,}000 years \\
+\bottomrule
+\end{tabularx}
+\end{center}
+So Argon2id is the last line of defence. What protects a copy is the secret's entropy, or a second secret that the copy doesn't contain. ``meinpasswort1234'' passes today's gate (\cref{sec:passphrase}).
+
+\paragraph{What the platforms offer apps.}
+\begin{itemize}
+  \item \textbf{Android:}
+  \begin{itemize}
+    \item Keystore keys can't be exported: an attacker ``might be able to use any app's Android Keystore keys on the Android device, but it can't extract them from the device'' \cite{androidks}. StrongBox, a secure element, is slower than the TEE.
+    \item Apps get no hardware attempt counter. The key builder has no setting for a minimum time between operations or a number of uses per boot, and \texttt{setMaxUsageCount} ``will be enforced in software'' where the hardware lacks it \cite{kgps}. Only keys bound to the lock screen inherit its hardware throttling (Gatekeeper, Weaver).
+    \item \texttt{setUnlockedDeviceRequired} limits a key to an unlocked device; it had bugs in Android 12--14.
+  \end{itemize}
+  \item \textbf{iOS} \cite{applesec}:
+  \begin{itemize}
+    \item The Secure Enclave holds P-256 keys for signing and key agreement.
+    \item Passcode guesses are entangled with the device's UID and throttled by the Secure Enclave.
+    \item ``This device only'' Keychain items are useless on another device.
+    \item \texttt{NSFileProtectionComplete} drops a file's key about 10 seconds after locking; the default class keeps it after first unlock.
+  \end{itemize}
+  \item \textbf{Sloth} (PoPETs 2024) uses the secure element's HMAC ``to provide a strict rate limit on password guessing'', on about 96\% of iPhones and 45\% of Android phones \cite{sloth}. Root on the device can still use such keys there \cite{keydroid}.
+  \item \textbf{NIST SP~800-63B-4} asks for 15 characters for single-factor passwords, and for the key of an extra keyed hash to be kept in hardware: ``brute-force attacks on the hashed passwords are impractical as long as the secret key value remains secret'' \cite{sp80063b}.
+\end{itemize}
+
+\paragraph{How others limit guessing.}
+\begin{itemize}
+  \item \textbf{1Password} mixes a 128-bit Secret Key into the derivation, so the data on its servers ``cannot be used in brute-force cracking attempts'' \cite{onepw}.
+  \item \textbf{Signal} (SVR3), \textbf{WhatsApp} (an HSM backup key vault) and \textbf{Apple's iCloud Keychain} escrow destroy the key after a fixed number of wrong guesses on their servers \cite{svr3,whatsappbk,applesec}.
+  \item \textbf{Bitwarden, Proton Pass, Standard Notes and Threema Safe} rely on the key-derivation function alone.
+\end{itemize}
+
+\paragraph{Proposal (\dref{P85}).}
+\begin{enumerate}
+  \item \textbf{A device-bound passphrase slot for daily unlock.}
+  \begin{itemize}
+    \item $A = \Argon(\mathit{pw})$ and $K_{\mathrm{pw}} = \KDF(A \concat \mathrm{HMAC}_{K_{\mathrm{hw}}}(A))$.
+    \item $K_{\mathrm{hw}}$ is a non-exportable HMAC key in StrongBox where the phone has one, else in the TEE; on iOS, a Secure Enclave key agreement takes its place.
+    \item It needs no user authentication, so the passphrase alone unlocks.
+    \item The HMAC's input depends on the guess, so every guess needs the device. A copy of the files without the device can't be guessed at all.
+    \item With root on the device, the attacker computes $A$ on GPUs and asks the hardware only for the HMAC, so guessing runs at the hardware's speed: fast in a TEE, slow in a secure element. Sloth stretches this with repeated secure-element operations \cite{sloth}.
+    \item If the hardware key is lost (e.g.\ by a reset), the recovery-key slot still opens the vault.
+  \end{itemize}
+  \item \textbf{No passphrase-only slot ever leaves the device.}
+  \begin{itemize}
+    \item Synced copies and backups carry the recovery-key slot and, for convenience, a two-secret slot $\KDF(\Argon(\mathit{pw}), \mathit{SK})$.
+    \item $\mathit{SK}$ is a 128-bit Secret Key kept on the user's devices and printed on the recovery sheet, as 1Password does.
+    \item A new device gets $\mathit{SK}$ by QR code from another device or from the sheet.
+  \end{itemize}
+  \item \textbf{The gate.} With 1 and 2, the passphrase only has to resist guessing on the device. So 15 characters and zxcvbn's score~3 can stay, once German word lists exist. Where a passphrase alone protects data (the browser, a desktop without a hardware key), require an estimated $10^{15}$ guesses (about 50 bits) or a generated passphrase.
+  \item \textbf{Hygiene:}
+  \begin{itemize}
+    \item keys are wiped when the vault locks (done, M8);
+    \item no operating-system backups (\dref{D52});
+    \item on iOS, \texttt{NSFileProtectionComplete} and exclusion from backups;
+    \item the Argon2id parameters re-measured on real phones, only with the user's consent.
+  \end{itemize}
+  \item \textbf{Server-side guess limits} (an HSM or an enclave) would protect even weak passphrases off the device, but they need a server: \dref{O26}.
+\end{enumerate}
 
 \section{The keyring}
 \label{sec:keyring}
@@ -346,6 +426,16 @@ Storage providers see the number, sizes and timing of encrypted files. Mitigatio
 \bibitem{zxcvbn} D.~L.~Wheeler. \emph{zxcvbn: Low-Budget Password Strength Estimation}. USENIX Security 2016.
 \bibitem{crockford} D.~Crockford. \emph{Base 32}. \url{https://www.crockford.com/base32.html}.
 \bibitem{crccat} G.~Cook. \emph{Catalogue of parametrised CRC algorithms}, CRC-16/IBM-3740. \url{https://reveng.sourceforge.io/crc-catalogue/16.htm}.
+\bibitem{hashcat7} hashcat. \emph{hashcat v7.0.0 release notes}. \url{https://github.com/hashcat/hashcat/blob/master/docs/releases_notes_v7.0.0.md}.
+\bibitem{sloth} D.~Hugenroth, A.~Sonnino, S.~Cutler, A.~R.~Beresford. \emph{Sloth: Key Stretching and Deniable Encryption using Secure Elements on Smartphones}. PoPETs 2024. \url{https://eprint.iacr.org/2023/1792}.
+\bibitem{keydroid} \emph{KeyDroid}. arXiv:2507.07927, 2025.
+\bibitem{androidks} Android Developers. \emph{Android Keystore system}. \url{https://developer.android.com/privacy-and-security/keystore}.
+\bibitem{kgps} Android Developers. \emph{KeyGenParameterSpec.Builder}. \url{https://developer.android.com/reference/android/security/keystore/KeyGenParameterSpec.Builder}.
+\bibitem{applesec} Apple. \emph{Apple Platform Security}: keychain data protection, Data Protection classes, passcodes, escrow security for iCloud Keychain. \url{https://support.apple.com/guide/security/}.
+\bibitem{onepw} 1Password. \emph{1Password Security Design}, version 0.5.2.1, March 2026. \url{https://agilebits.github.io/security-design/}.
+\bibitem{svr3} Signal. \emph{Secure Value Recovery}, 2020, \url{https://signal.org/blog/secure-value-recovery/}; SVR3: IACR ePrint 2024/887.
+\bibitem{whatsappbk} WhatsApp. \emph{Security of End-to-End Encrypted Backups}, white paper. \url{https://www.whatsapp.com/security/WhatsApp_Security_Encrypted_Backups_Whitepaper.pdf}.
+\bibitem{jhu2021} M.~Zinkus, T.~M.~Jois, M.~Green. \emph{Data Security on Mobile Devices: Current State of the Art, Open Problems, and Proposed Solutions}. arXiv:2105.12613, 2021.
 \bibitem{eff} EFF. \emph{EFF's New Wordlists for Random Passphrases}, 2016. \url{https://www.eff.org/dice}.
 \end{thebibliography}
 
