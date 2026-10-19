@@ -8,7 +8,10 @@ use zeroize::Zeroizing;
 use crate::rand::{self, OsRng, Rng};
 use crate::{Error, Result};
 
-pub const MIN_CHARS: usize = 12;
+/// NIST SP 800-63B-4's minimum for a password that is the only factor (D54,
+/// 19 Oct 2026): a copied vault can be attacked offline, so ours mustn't be
+/// lower.
+pub const MIN_CHARS: usize = 15;
 pub const MAX_CHARS: usize = 1024;
 /// zxcvbn's score 3: "safely unguessable: moderate protection from offline
 /// slow-hash scenario".
@@ -186,16 +189,20 @@ mod tests {
     #[test]
     fn length_rules() {
         assert_eq!(strength("").hint, Hint::TooShort);
-        assert_eq!(strength("Kx9#mQ2$vL7").hint, Hint::TooShort); // 11 characters
+        // D54: 15 characters at least; 14 are too few.
+        assert_eq!(strength("Kx9#mQ2$vL7&pR").hint, Hint::TooShort);
+        assert_eq!(strength("Kx9#mQ2$vL7&pR4").hint, Hint::None);
         assert_eq!(strength(&"word ".repeat(300)).hint, Hint::TooLong);
         // Trailing spaces don't count towards the length.
-        assert_eq!(strength("Kx9#mQ2$vL7    ").hint, Hint::TooShort);
+        assert_eq!(strength("Kx9#mQ2$vL7&pR    ").hint, Hint::TooShort);
     }
 
     #[test]
     fn weak_passphrases_are_refused_with_a_hint() {
         for (p, hint) in [
-            ("password1234", Hint::CommonPassword),
+            // One entry of zxcvbn's list (rank 12,590), so no other match
+            // ties with it and the hint is always the same (see below).
+            ("qwerty123456789", Hint::CommonPassword),
             // Most keyboard walks are on zxcvbn's list of common passwords
             // ("qwertyuiopasdf" is), so this one is longer and unusual.
             ("asdfghjkl;'zxcvb", Hint::KeyboardPattern),
@@ -206,6 +213,33 @@ mod tests {
             assert!(!s.acceptable, "{p}");
             assert_eq!(s.hint, hint, "{p}");
             assert_eq!(check(&normalize(p)), Err(Error::PassphraseTooWeak), "{p}");
+        }
+    }
+
+    // Regression (19 Oct 2026): zxcvbn 3.1.1 walks hash maps in random order
+    // and keeps the first of two equally cheap match sequences. For
+    // "password123456789" the digits are a dictionary word or a sequence,
+    // both at its floor of 50 guesses, so its warning, and our hint, change
+    // from call to call. A test that expected one of them failed at random.
+    // Only the hint may change, never the score: whether a passphrase is
+    // accepted must not depend on chance.
+    #[test]
+    fn regression_2026_10_19_zxcvbn_ties_change_only_the_hint() {
+        for p in ["password123456789", "football12345678", "letmein123456789"] {
+            let first = strength(p);
+            for _ in 0..300 {
+                let s = strength(p);
+                assert_eq!(
+                    (s.score, s.acceptable),
+                    (first.score, first.acceptable),
+                    "{p}"
+                );
+                assert!(
+                    matches!(s.hint, Hint::CommonPassword | Hint::Sequence),
+                    "{p}: {:?}",
+                    s.hint
+                );
+            }
         }
     }
 

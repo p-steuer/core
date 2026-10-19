@@ -134,8 +134,8 @@ fn passphrase_rules_apply_at_setup() {
     let mut rng = TestRng::new("rules");
     for (pw, error) in [
         ("short", Error::PassphraseTooShort),
-        ("password1234", Error::PassphraseTooWeak),
-        ("  password1234   ", Error::PassphraseTooWeak),
+        ("qwerty123456789", Error::PassphraseTooWeak),
+        ("  qwerty123456789   ", Error::PassphraseTooWeak),
     ] {
         assert_eq!(
             PendingVault::prepare_with(pw, &mut rng, TEST).err(),
