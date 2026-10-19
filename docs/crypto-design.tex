@@ -95,14 +95,16 @@ Large files & XChaCha20-Poly1305 per chunk, see \cref{sec:blobs} & \texttt{chach
 KDF & HKDF-SHA-256 \cite{rfc5869} with labelled info strings (\dref{P62}) & \texttt{hkdf} 0.13.0, \texttt{sha2} 0.11.1 \\
 MAC & HMAC-SHA-256 \cite{rfc2104} & \texttt{hmac} 0.13.0 \\
 Passphrase hashing & Argon2id, version 0x13, $m = 64$\,MiB, $t = 3$, $p = 4$ (\cref{sec:passphrase}) & \texttt{argon2} 0.6.0 \\
-Key encapsulation & X-Wing (X25519 + ML-KEM-768); not used before sync & later: libsodium 1.0.22 \\
-Signatures & Ed25519 \emph{and} ML-DSA-65; both must verify; not used before sync & later: libsodium, libcrux \\
+Key encapsulation & X-Wing (MLKEM768-X25519, HPKE KEM \texttt{0x647a} \cite{hpkepq}); for sealed containers (\cref{sec:sealed}) and sync & to choose: RustCrypto \texttt{x-wing} 0.1.1 (not audited) or libsodium 1.0.22 \\
+Signatures & Composite ML-DSA-65 + Ed25519 (\texttt{id-MLDSA65-Ed25519-SHA512} \cite{compsig}); both must verify & to choose: RustCrypto \texttt{ml-dsa} 0.1.1 (not audited) with Ed25519; libsodium 1.0.22 has no ML-DSA \\
 Randomness & The operating system's CSPRNG & \texttt{getrandom} 0.4.3 \\
 \bottomrule
 \end{tabularx}
 
 \medskip
 \noindent All crates are pinned to exact versions and are pure Rust; the core itself forbids \texttt{unsafe} code. MVP~1 uses RustCrypto for all of suite~1 (\dref{D45}); the post-quantum public-key parts arrive with sync and sharing.
+
+\noindent\textbf{BSI TR-02102-1} (version 2026-01, read 19 October 2026) recommends using post-quantum KEMs as hybrids, and post-quantum signatures ``grundsätzlich nur in Kombination mit einem klassischen Signaturverfahren'': the hybrid is valid only if all its signatures are, and its keys serve only the hybrid. Suite~1 follows both rules. The guideline doesn't list X25519, Ed25519 or ChaCha20-Poly1305, though, so suite~1 doesn't claim conformance with it \cite{bsi}.
 
 \noindent\textbf{Suite identifiers.} Every encrypted object starts with a header $h = (\mathit{format\_version}, \mathit{suite\_id}, \ldots)$ that is bound as associated data, so it can't be changed without detection.
 
@@ -362,12 +364,155 @@ Because $\sigma$ is a symmetric secret, an attacker who later breaks X25519 stil
 
 \begin{itemize}
   \item \textbf{Share container}: each share has a random key $K_{\mathrm{share}}$ and contains only the selected records and fields (\dref{P27}).
-  \item \textbf{Key delivery}: for each recipient with an X-Wing public key $pk_R$: $(ct, ss) = \mathsf{XWing}.\Encaps(pk_R)$ and $K_{\mathrm{share}}$ is wrapped under $\KDF(ss, \mathit{share\_id} \concat \mathit{sender\_key\_id} \concat \mathit{recipient\_key\_id})$, in the style of HPKE.
-  \item \textbf{Manifest}: share identifier, selection, permissions (read or read-write, \dref{D18}), expiry and recipients, signed by the sender (Ed25519 and ML-DSA-65).
+  \item \textbf{Key delivery}: one HPKE stanza with X-Wing per recipient (\cref{sec:sealed}).
+  \item \textbf{Manifest}: share identifier, selection, permissions (read or read-write, \dref{D18}), expiry and recipients, signed by the sender with the composite signature (\cref{sec:sealed}).
   \item \textbf{Read-write}: a recipient's changes are signed with their identity key; the owner's devices merge them only if the manifest allows those record types and fields.
   \item \textbf{Revocation}: a new $K_{\mathrm{share}}$ for the remaining recipients; revoked recipients keep what they already received.
   \item \textbf{Links for people without the app}: a random key in the URL fragment (never sent to any server), the ciphertext in the sender's own cloud storage (\dref{D24}).
 \end{itemize}
+
+\subsection{Sealed containers (format 1, proposal \dref{P88})}
+\label{sec:sealed}
+\emph{Research of 19 October 2026.} A sealed container carries one document of our JSON format family (\texttt{FORMATS.md} \S9) to its recipients, to a link, or into the user's own export: a training session, a plan, a meal plan, a set of measurements. The design follows age~v1 \cite{age}. It adds 256-bit keys, an inner signed envelope, padding, and rules for ongoing shares.
+
+\paragraph{Why copies, not per-record keys.} A share never uses the vault's keys. It holds a copy of only the selected records and fields under a fresh key (\dref{P27}). That gives selection down to single fields and revocation per share, and no key leaves the device. 1Password's item links and Bitwarden Send share copies in the same way. Per-record keys in the vault would show the number and sizes of records at rest, and still couldn't leave out fields. Read-write spaces (\dref{D18}) get a space key and a journal of their own.
+
+\paragraph{Keys.} Each container gets a fresh 256-bit content key $\mathit{CEK}$, from which two keys are derived:
+\begin{itemize}
+  \item $k_{\mathrm{hdr}} = \KDF(\mathit{CEK}, \str{sc-share/v1 header})$;
+  \item $k_{\mathrm{pay}} = \KDF(\mathit{CEK}, \mathit{salt} = n_{\mathrm{pay}}, \str{sc-share/v1 payload} \concat \mathrm{SHA\text{-}256}(\mathit{header}))$, with $n_{\mathrm{pay}}$ 16 random bytes.
+\end{itemize}
+
+\paragraph{Header.} Text lines, as in age, so it can be inspected:
+\begin{itemize}
+  \item \texttt{sc-share/v1}. The version fixes every algorithm, and nothing is negotiated.
+  \item One stanza per recipient. Stanzas name no recipient, so each recipient tries them. Post-quantum and classical recipients are never mixed (there are no classical types).
+  \begin{itemize}
+    \item \texttt{-> xwing} with $\mathit{enc}$ (1{,}120 bytes):
+    \begin{itemize}
+      \item HPKE base mode \cite{rfc9180} with the KEM MLKEM768-X25519 (\texttt{0x647a}, which is X-Wing \cite{hpkepq,xwingdraft}), HKDF-SHA256 and ChaCha20-Poly1305;
+      \item \texttt{info} = \str{sc-share/v1 xwing}, empty associated data;
+      \item the body is the sealed $\mathit{CEK}$ (48 bytes).
+    \end{itemize}
+    This is age's \texttt{mlkem768x25519} construction with our own label and a 256-bit key.
+    \item \texttt{-> link} with a salt: the body is $\AEAD.\Enc(K_{\mathrm{link}}, \mathit{CEK})$, where $K_{\mathrm{link}} = \KDF(S, \str{sc-share/v1 link})$, or $\KDF(S \concat \Argon(\mathit{pw}), \ldots)$ with an optional password.
+    \item \texttt{-> epoch} with a stream id and epoch $e$: the body is $\mathit{CEK}$ wrapped under $\KDF(\mathit{EK}_e, \str{sc-share/v1 epoch} \concat \mathit{stream\_id} \concat e)$ (ongoing shares, below).
+    \item \texttt{-> pw-sk} and \texttt{-> recovery}, for exports to oneself: the passphrase together with the Secret Key, or the recovery key. Never the passphrase alone (\dref{P85}).
+  \end{itemize}
+  \item \texttt{---} and $\mathrm{HMAC\text{-}SHA\text{-}256}(k_{\mathrm{hdr}}, \mathit{header})$, over everything up to the mark. Each recipient checks it with the $\mathit{CEK}$ from its own stanza. So the MAC commits to one key, and recipients who accept a container all hold the same $\mathit{CEK}$ (against ``invisible salamanders'' \cite{albertini}).
+\end{itemize}
+
+\paragraph{Payload.} $n_{\mathrm{pay}}$, then the envelope in 64\,KiB chunks under $k_{\mathrm{pay}}$, with ChaCha20-Poly1305 \cite{rfc8439}:
+\begin{itemize}
+  \item the nonce is an 11-byte big-endian chunk counter followed by a final-chunk flag (age's STREAM \cite{stream});
+  \item an overflowing counter is an error;
+  \item nothing is compressed.
+\end{itemize}
+
+\paragraph{Envelope} (inside the encryption):
+\begin{itemize}
+  \item a 4-byte length and $\mathit{meta}$, JSON from our deterministic writer;
+  \item a 4-byte length and the $\mathit{document}$;
+  \item a 2-byte length and the signature;
+  \item zero padding to the Padm\'e length of the whole envelope \cite{padme}, and at least 1\,KiB.
+\end{itemize}
+$\mathit{meta}$ holds:
+\begin{itemize}
+  \item the document's format and version;
+  \item the sender's identity keys;
+  \item the recipients' key fingerprints and roles;
+  \item the creation time;
+  \item for ongoing shares, $\mathit{stream\_id}$, $e$, $\mathit{seq}$, $\mathit{prev\_hash}$, the expiry, and a manifest (each item's id with the SHA-256 of its bytes, and deletions).
+\end{itemize}
+
+\paragraph{Signature.}
+\begin{itemize}
+  \item Composite ML-DSA-65 + Ed25519 \cite{compsig}, with keys used for nothing else.
+  \item It signs $\str{sc-share/v1 sig} \concat \mathrm{SHA\text{-}512}(\mathit{header}) \concat \mathrm{SHA\text{-}512}(\mathit{meta}) \concat \mathrm{SHA\text{-}512}(\mathit{document})$, where the header includes its MAC.
+  \item It sits inside the encryption, so storage never sees the sender.
+  \item It covers the header, so a recipient can't re-encrypt a signed document to someone else (surreptitious forwarding \cite{davis}), and the recipient list is signed.
+\end{itemize}
+
+\paragraph{Checks, in this order.}
+\begin{enumerate}
+  \item Parse the header strictly, with limits on stanzas and sizes.
+  \item Open a stanza.
+  \item Verify the header MAC.
+  \item Decrypt the payload and read the lengths.
+  \item Verify the signature over the exact bytes.
+  \item Check the sender against the contacts (a changed key is flagged, \dref{P28}), and check that we are among the recipients.
+  \item Only then parse the JSON (I-JSON, with limits).
+\end{enumerate}
+Signatures and hashes cover the exact bytes, and nothing is re-serialized before it is verified. Our writer is deterministic, so JCS isn't needed.
+
+\paragraph{Ongoing shares.}
+\begin{itemize}
+  \item A stream, with a random 128-bit id, has epochs. The key $\mathit{EK}_e$ of epoch $e$ reaches the members in a signed container with \texttt{xwing} stanzas.
+  \item Each update has a fresh $\mathit{CEK}$ in an \texttt{epoch} stanza, so updates stay small; an \texttt{xwing} stanza costs about 1.2\,KB per recipient.
+  \item $\mathit{seq}$ grows by one, and $\mathit{prev\_hash}$ chains the containers.
+  \begin{itemize}
+    \item A gap, a fork or a lower $\mathit{seq}$ is shown as an error, and an expired update as stale, as in TUF \cite{tuf}.
+    \item The manifest lists all current items, so items can't be mixed from different versions.
+  \end{itemize}
+  \item Removing a member starts a new epoch. What they already received stays readable.
+  \item Item ids in a share are $\mathrm{HMAC}(\mathit{EK}_{\mathrm{ids}}, \mathit{id})$ in UUID form, with one id key per stream: stable across updates, unlinkable between shares, and hiding the creation time that our UUIDv7 ids reveal.
+\end{itemize}
+
+\paragraph{Links} (\dref{P29}):
+\begin{itemize}
+  \item \textbf{The secret:} $S$ (32 random bytes) goes in the URL fragment, together with the container's address in the user's own cloud (\dref{D24}).
+  \item \textbf{The viewer} is static:
+  \begin{itemize}
+    \item a strict CSP, Subresource Integrity and \texttt{Referrer-Policy: no-referrer};
+    \item it removes the fragment from the address bar and history, and decrypts locally;
+    \item links expire after a short time by default.
+  \end{itemize}
+  \item \textbf{The limit:} whoever serves the viewer's code could steal keys, and the app says so.
+\end{itemize}
+
+\paragraph{What leaks.}
+\begin{itemize}
+  \item The padded size.
+  \item The number of stanzas. Dummy stanzas can't cheaply be made to look like X-Wing ones (unverified).
+  \item For ongoing shares, when updates happen. Batching them, e.g.\ daily, hides activity.
+\end{itemize}
+
+\paragraph{Implementation.}
+\begin{itemize}
+  \item \textbf{Libraries} (19 October 2026):
+  \begin{itemize}
+    \item RustCrypto's \texttt{x-wing} 0.1.1 (draft~06, the same wire format as draft~11) has ``never been independently audited''; so have \texttt{ml-kem} 0.3.3, \texttt{ml-dsa} 0.1.1 and \texttt{hpke} 0.14 (per the research).
+    \item libsodium 1.0.22 offers X-Wing, but no ML-DSA and no HPKE.
+  \end{itemize}
+  \item \textbf{The hybrid as a safety net:} the classical halves keep today's security even if the post-quantum code has a bug that leaks no keys.
+  \item \textbf{Before sharing ships:}
+  \begin{itemize}
+    \item the drafts' test vectors (X-Wing, HPKE-PQ, composite signatures), age's vectors for the stanza construction, and Wycheproof;
+    \item golden containers;
+    \item fuzzing of both parsers;
+    \item an external audit \todo{choose the library; audit}.
+  \end{itemize}
+\end{itemize}
+
+\paragraph{Standards status} (19 October 2026):
+\begin{itemize}
+  \item \textbf{X-Wing} is draft-connolly-cfrg-xwing-kem-11, an independent submission and not an RFC \cite{xwingdraft}. The CFRG's hybrid-KEM draft calls the same construction MLKEM768-X25519.
+  \item \textbf{HPKE-PQ} (draft-05) gives it the code \texttt{0x647a} and has no Auth modes \cite{hpkepq}.
+  \item \textbf{The composite signatures} (draft-19) are in the RFC Editor's queue \cite{compsig}.
+  \item \textbf{age 1.3} added the \texttt{mlkem768x25519} recipients \cite{age}.
+  \item \textbf{COSE and JOSE} have no post-quantum HPKE yet. OpenPGP has it (RFC~9980, per the research), but it is much larger than we need.
+\end{itemize}
+
+\paragraph{Avoid.}
+\begin{itemize}
+  \item HPKE's Auth modes (dropped in the revision of RFC~9180; X-Wing has none), and treating a KEM as proof of the sender.
+  \item Algorithm negotiation.
+  \item Secrets in URL paths or queries.
+  \item Re-serializing before verifying.
+  \item Fields encrypted one by one without binding them together.
+  \item Unaudited code without test vectors.
+\end{itemize}
+
 
 \section{The browser client}
 \label{sec:web}
@@ -426,6 +571,14 @@ Storage providers see the number, sizes and timing of encrypted files. Mitigatio
 \bibitem{zxcvbn} D.~L.~Wheeler. \emph{zxcvbn: Low-Budget Password Strength Estimation}. USENIX Security 2016.
 \bibitem{crockford} D.~Crockford. \emph{Base 32}. \url{https://www.crockford.com/base32.html}.
 \bibitem{crccat} G.~Cook. \emph{Catalogue of parametrised CRC algorithms}, CRC-16/IBM-3740. \url{https://reveng.sourceforge.io/crc-catalogue/16.htm}.
+\bibitem{age} C2SP. \emph{The age file format, version~1}, with the \texttt{mlkem768x25519} recipient type (age 1.3). \url{https://github.com/C2SP/C2SP/blob/main/age.md}.
+\bibitem{hpkepq} IETF HPKE working group. \emph{Post-quantum algorithms for HPKE}. draft-ietf-hpke-pq-05, 6 July 2026.
+\bibitem{xwingdraft} D.~Connolly et al. \emph{X-Wing}. draft-connolly-cfrg-xwing-kem-11, 23 September 2026 (Independent Submission).
+\bibitem{compsig} IETF LAMPS working group. \emph{Composite ML-DSA signatures}. draft-ietf-lamps-pq-composite-sigs-19 (RFC Editor queue, October 2026).
+\bibitem{padme} K.~Nikitin, L.~Barman, W.~Lueks, M.~Underwood, J.-P.~Hubaux, B.~Ford. \emph{Reducing Metadata Leakage from Encrypted Files and Communication with PURBs}. PoPETs 2019.
+\bibitem{davis} D.~Davis. \emph{Defective Sign \& Encrypt in S/MIME, PKCS\#7, MOSS, PEM, PGP, and XML}. USENIX Annual Technical Conference, 2001.
+\bibitem{stream} V.~T.~Hoang, R.~Reyhanitabar, P.~Rogaway, D.~Viz\'ar. \emph{Online Authenticated-Encryption and its Nonce-Reuse Misuse-Resistance}. CRYPTO 2015.
+\bibitem{tuf} \emph{The Update Framework specification}, version 1.0.37. \url{https://theupdateframework.github.io/specification/latest/}.
 \bibitem{hashcat7} hashcat. \emph{hashcat v7.0.0 release notes}. \url{https://github.com/hashcat/hashcat/blob/master/docs/releases_notes_v7.0.0.md}.
 \bibitem{sloth} D.~Hugenroth, A.~Sonnino, S.~Cutler, A.~R.~Beresford. \emph{Sloth: Key Stretching and Deniable Encryption using Secure Elements on Smartphones}. PoPETs 2024. \url{https://eprint.iacr.org/2023/1792}.
 \bibitem{keydroid} \emph{KeyDroid}. arXiv:2507.07927, 2025.
