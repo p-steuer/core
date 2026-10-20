@@ -18,7 +18,7 @@ pub mod suite;
 pub mod vault;
 
 pub use error::{Error, Result};
-pub use id::new_record_id;
+pub use id::{new_record_id, new_record_id_at};
 
 /// The core's version, for the app's "About" screen and compatibility checks.
 pub fn version() -> &'static str {

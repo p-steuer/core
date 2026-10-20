@@ -4,14 +4,24 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::Result;
 use crate::rand::{self, OsRng, Rng};
+use crate::{Error, Result};
 
 pub fn new_record_id() -> Result<String> {
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    uuid_v7(ms, &mut OsRng)
+}
+
+/// An identifier stamped with another time than now: a session logged
+/// afterwards, or one imported with its real date. Archives go by this time
+/// (D55, P95), so the record lands in the year it belongs to.
+pub fn new_record_id_at(ms: u64) -> Result<String> {
+    if ms >= 1 << 48 {
+        return Err(Error::InvalidInput("time"));
+    }
     uuid_v7(ms, &mut OsRng)
 }
 
@@ -98,6 +108,19 @@ mod tests {
         let mut other = bytes;
         other[8] &= 0x3F;
         assert_eq!(created_year(&other), None);
+    }
+
+    #[test]
+    fn ids_can_carry_another_time() {
+        // 1 June 2019, as for an imported session.
+        let ms = 1_559_347_200_000;
+        let id = new_record_id_at(ms).unwrap();
+        let bytes = crate::store::unhex16(&id.replace('-', "")).unwrap();
+        assert_eq!(created_year(&bytes), Some(2019));
+        assert_eq!(crate::store::year_of(&id), Some(2019));
+        assert_ne!(new_record_id_at(ms).unwrap(), id);
+        assert!(new_record_id_at((1 << 48) - 1).is_ok());
+        assert_eq!(new_record_id_at(1 << 48), Err(Error::InvalidInput("time")));
     }
 
     #[test]
