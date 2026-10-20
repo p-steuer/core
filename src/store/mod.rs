@@ -13,7 +13,7 @@ pub(crate) mod journal;
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::de::{self, SeqAccess, Visitor};
 use serde::ser::SerializeTuple;
@@ -103,6 +103,11 @@ fn valid_id(s: &str) -> bool {
     (1..=64).contains(&s.len())
         && s.bytes()
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
+/// The UTC year a record was created in, if its id is a UUIDv7 (D55).
+pub(crate) fn year_of(id: &str) -> Option<i32> {
+    codec::uuid_bytes(id).and_then(|b| crate::id::created_year(&b))
 }
 
 /// Kinds starting with "_" are the core's own and can't be read or written
@@ -356,6 +361,14 @@ impl Id {
 
     fn to_text(&self) -> String {
         self.with_text(str::to_owned)
+    }
+
+    /// The year the record was created in, if its id is a UUIDv7.
+    fn year(&self) -> Option<i32> {
+        match self {
+            Id::Uuid(b) => crate::id::created_year(b),
+            Id::Text(_) => None,
+        }
     }
 }
 
@@ -762,9 +775,18 @@ impl Store {
     /// compaction: deleted records and overwritten or deleted values are left
     /// out.
     pub(crate) fn snapshot(&self) -> impl Iterator<Item = Op> + '_ {
+        self.snapshot_where(|_| true)
+    }
+
+    /// The snapshot of the records whose year of creation (`None` for ids
+    /// that aren't UUIDv7) passes `keep`.
+    pub(crate) fn snapshot_where(
+        &self,
+        keep: impl Fn(Option<i32>) -> bool + 'static,
+    ) -> impl Iterator<Item = Op> + '_ {
         self.records
             .iter()
-            .filter(|(_, r)| r.visible())
+            .filter(move |((_, id), r)| r.visible() && keep(id.year()))
             .map(|((kind, id), r)| {
                 let mut fields: Vec<(String, Stamp, Value)> = r
                     .visible_fields()
@@ -778,6 +800,27 @@ impl Store {
                     fields,
                 }
             })
+    }
+
+    /// The years of creation of all records held, deleted ones included.
+    pub(crate) fn years(&self) -> BTreeSet<i32> {
+        self.records
+            .keys()
+            .filter_map(|(_, id)| id.year())
+            .collect()
+    }
+
+    /// Drops the records whose year of creation doesn't pass `keep`.
+    pub(crate) fn retain_years(&mut self, keep: impl Fn(Option<i32>) -> bool) {
+        self.records.retain(|(_, id), _| keep(id.year()));
+    }
+
+    /// Applies a batch read from an archive. It adds to what is in memory
+    /// but not to the journal, so it doesn't count towards compaction.
+    pub(crate) fn apply_archived(&mut self, batch: &Batch, device: [u8; 16]) {
+        let (writes, deletes) = (self.writes, self.deletes);
+        self.apply(batch, device, 0);
+        (self.writes, self.deletes) = (writes, deletes);
     }
 
     /// The store as rebuilt from a snapshot: same records, no history.

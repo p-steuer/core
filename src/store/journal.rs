@@ -34,6 +34,9 @@ use crate::rand::Rng;
 use crate::{Error, Result};
 
 const MAGIC: &[u8; 8] = b"SCJOURNL";
+/// Archive segments (D55) have the same layout under their own magic, with
+/// their year where a journal has its generation.
+const ARCHIVE_MAGIC: &[u8; 8] = b"SCARCHIV";
 /// Batches as JSON, padded with spaces (MVP 1).
 pub(crate) const FORMAT_JSON: u16 = 1;
 /// Batches in the binary encoding of [`codec`], padded with zeros (D55).
@@ -67,8 +70,23 @@ pub(crate) fn generation_of(name: &str) -> Option<u32> {
 }
 
 pub(crate) fn header(format: u16, suite: u16, vault_id: &[u8; 16], generation: u32) -> Header {
+    header_with(MAGIC, format, suite, vault_id, generation)
+}
+
+/// The header of an archive segment of `year`.
+pub(crate) fn archive_header(format: u16, suite: u16, vault_id: &[u8; 16], year: u32) -> Header {
+    header_with(ARCHIVE_MAGIC, format, suite, vault_id, year)
+}
+
+fn header_with(
+    magic: &[u8; 8],
+    format: u16,
+    suite: u16,
+    vault_id: &[u8; 16],
+    generation: u32,
+) -> Header {
     let mut h = [0u8; HEADER_LEN];
-    h[..8].copy_from_slice(MAGIC);
+    h[..8].copy_from_slice(magic);
     h[8..10].copy_from_slice(&format.to_le_bytes());
     h[10..12].copy_from_slice(&suite.to_le_bytes());
     h[12..28].copy_from_slice(vault_id);
@@ -182,15 +200,16 @@ impl std::fmt::Debug for Contents {
     }
 }
 
-/// Reads a whole journal file of either format. `expected` is this vault's
-/// header for the generation; only its format may differ from the file's.
+/// Reads a whole journal or archive file of either format. `expected` is
+/// this vault's header for the generation or year; only its format may
+/// differ from the file's.
 pub(crate) fn read(
     bytes: &[u8],
     key: &SecretKey,
     expected: &Header,
     device: &[u8; 16],
 ) -> Result<Contents> {
-    if bytes.len() < HEADER_LEN || bytes[..8] != MAGIC[..] {
+    if bytes.len() < HEADER_LEN || bytes[..8] != expected[..8] {
         return Err(Error::Damaged("journal header"));
     }
     let format = u16::from_le_bytes([bytes[8], bytes[9]]);

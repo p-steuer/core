@@ -582,13 +582,32 @@ fn measure_years_of_daily_sessions() {
             .unwrap();
         kb / 1e3
     };
-    let id = || crate::new_record_id().unwrap();
+    // The vault's clock and the records' ids follow the simulated days, so
+    // old years go to archives (D55).
+    let now = Arc::new(AtomicU64::new(1_700_000_000_000));
+    let cfg = Config {
+        params: TEST_PARAMS,
+        clock: Clock::Manual(now.clone()),
+    };
+    let id = || crate::id::uuid_v7(now.load(Ordering::SeqCst), &mut OsRng).unwrap();
     let rec = |kind: &str, id: &str, f: Value| put(kind, id, f);
+    let archive_mb = || -> f64 {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("archive-"))
+            .map(|e| e.metadata().unwrap().len())
+            .sum::<u64>() as f64
+            / 1e6
+    };
 
-    let mut v = make(dir);
+    let mut v = PendingVault::prepare_with(PASSPHRASE, &mut TestRng::new("store"), cfg.clone())
+        .unwrap()
+        .create_in(Dir::new(dir))
+        .unwrap();
     v.lock();
     let t = Instant::now();
-    let mut v = unlock(dir);
+    let mut v = unlock_with(Dir::new(dir), cfg.clone());
     let base_ms = t.elapsed().as_secs_f64() * 1e3;
     let base_rss = rss_mb();
     println!("baseline: unlock {base_ms:.0} ms (Argon2id test parameters), RSS {base_rss:.0} MB");
@@ -596,6 +615,7 @@ fn measure_years_of_daily_sessions() {
     // One session; `app_like` commits it as the app does.
     let session = |v: &mut Vault, day: i64, app_like: bool| {
         let start = 1_700_000_000_000 + day * DAY_MS;
+        now.store(start as u64, Ordering::SeqCst);
         let s = id();
         let session_fields = |ended: Option<i64>| json!({"started_ms": start, "tz_min": 60, "name": "Push day", "notes": null, "ended_ms": ended});
         let mut all = vec![rec("session", &s, session_fields(None))];
@@ -698,7 +718,7 @@ fn measure_years_of_daily_sessions() {
     println!("  after compaction ({secs:.2} s): {:.2} MB", journal_mb());
 
     println!(
-        "years | sessions | journal MB | compaction s | unlock ms (minus Argon2id) | MB after unlock | MB peak"
+        "years | sessions | journal MB | archives MB | compaction s | unlock ms (minus Argon2id) | MB after unlock | MB peak | load a year ms | MB with it"
     );
     for years in [1i64, 5, 10, 25, 50] {
         while day < years * 365 {
@@ -717,6 +737,7 @@ fn measure_years_of_daily_sessions() {
                 "vault::store_tests::unlock_probe",
             ])
             .env("SC_PROBE_DIR", dir)
+            .env("SC_PROBE_NOW", now.load(Ordering::SeqCst).to_string())
             .output()
             .unwrap();
         let out = String::from_utf8_lossy(&out.stdout);
@@ -728,18 +749,21 @@ fn measure_years_of_daily_sessions() {
             .map(|x| x.parse().unwrap())
             .collect();
         let (ms, after, peak) = (probe[0] - base_ms, probe[1], probe[2]);
+        let (load_ms, with_year) = (probe[3], probe[4]);
         println!(
-            "{years:5} | {day:8} | {:10.1} | {secs:12.2} | {ms:26.0} | {after:15.0} | {peak:7.0}",
-            journal_mb()
+            "{years:5} | {day:8} | {:10.1} | {:11.1} | {secs:12.2} | {ms:26.0} | {after:15.0} | {peak:7.0} | {load_ms:14.0} | {with_year:10.0}",
+            journal_mb(),
+            archive_mb()
         );
-        v = unlock(dir);
+        v = unlock_with(Dir::new(dir), cfg.clone());
     }
     let _ = base_rss;
 }
 
-/// Unlocks the vault in `SC_PROBE_DIR` and prints the time it took, the
-/// memory it holds afterwards and its peak (both above what the process held
-/// before), for [`measure_years_of_daily_sessions`].
+/// Unlocks the vault in `SC_PROBE_DIR` at the time `SC_PROBE_NOW` and prints
+/// the time it took, the memory it holds afterwards and its peak (both above
+/// what the process held before), then the time to load one archived year
+/// and the memory with it, for [`measure_years_of_daily_sessions`].
 #[test]
 #[ignore]
 fn unlock_probe() {
@@ -757,15 +781,27 @@ fn unlock_probe() {
             .unwrap();
         kb / 1e3
     };
+    let now: u64 = std::env::var("SC_PROBE_NOW").unwrap().parse().unwrap();
+    let config = Config {
+        params: TEST_PARAMS,
+        clock: Clock::Manual(Arc::new(AtomicU64::new(now))),
+    };
     let before = status("VmRSS:");
     let t = std::time::Instant::now();
-    let v = unlock(std::path::Path::new(&dir));
+    let mut v = unlock_with(Dir::new(std::path::Path::new(&dir)), config);
     let ms = t.elapsed().as_secs_f64() * 1e3;
-    println!(
-        "PROBE {ms} {} {}",
-        status("VmRSS:") - before,
-        status("VmHWM:") - before
-    );
+    let (after, peak) = (status("VmRSS:") - before, status("VmHWM:") - before);
+    // And one whole archived year brought back: the middle one (the first
+    // is only seven weeks long).
+    let (mut load_ms, mut with_year) = (0.0, after);
+    let years = v.archive_years().unwrap();
+    if let Some(year) = years.get(years.len() / 2).copied() {
+        let t = std::time::Instant::now();
+        v.load_archive(year).unwrap();
+        load_ms = t.elapsed().as_secs_f64() * 1e3;
+        with_year = status("VmRSS:") - before;
+    }
+    println!("PROBE {ms} {after} {peak} {load_ms} {with_year}");
     drop(v);
 }
 

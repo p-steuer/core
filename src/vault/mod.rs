@@ -18,10 +18,11 @@
 //! When a write fails so that the state on disk is uncertain, the vault
 //! refuses further changes until it is opened again.
 
+mod archive;
 mod keyring;
 mod lock;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::Path;
 
@@ -37,7 +38,7 @@ use crate::keys::recovery::RecoveryKey;
 use crate::rand::{self, OsRng, Rng};
 use crate::store::hlc::{self, Clock};
 use crate::store::journal::{self, End};
-use crate::store::{self, Batch, Change, Op, Record, Store, codec};
+use crate::store::{self, Batch, Change, Op, Record, Stamp, Store, codec};
 use crate::{Error, Result};
 use keyring::{Keyring, KeyringKeys, PURPOSE_JOURNAL, PassphraseSlot, RecoverySlot};
 use lock::VaultLock;
@@ -170,6 +171,8 @@ impl PendingVault {
                     next_seq: 1,
                 },
                 store: Store::default(),
+                loaded: BTreeMap::new(),
+                requested: BTreeSet::new(),
                 hlc: 0,
                 pending_recovery: None,
                 leftover_files: false,
@@ -204,6 +207,12 @@ struct Open {
     keyring: Keyring,
     journal: ActiveJournal,
     store: Store,
+    /// The archived years whose records are in memory, and whether they were
+    /// changed since their archive was written (D55). A year is in memory
+    /// while the app asks for it, or while the journal holds changes to it.
+    loaded: BTreeMap<i32, bool>,
+    /// The archived years the app asked for.
+    requested: BTreeSet<i32>,
     /// The last clock value written.
     hlc: u64,
     pending_recovery: Option<RecoveryKey>,
@@ -347,7 +356,7 @@ impl Vault {
             let _ = clean_up_blobs(&blobs, &store);
         }
         let hlc = store.max_hlc();
-        Ok(Self {
+        let mut vault = Self {
             dir,
             config,
             status,
@@ -367,11 +376,15 @@ impl Vault {
                     next_seq,
                 },
                 store,
+                loaded: BTreeMap::new(),
+                requested: BTreeSet::new(),
                 hlc,
                 pending_recovery: None,
                 leftover_files: false,
             }),
-        })
+        };
+        vault.open_archives();
+        Ok(vault)
     }
 
     pub fn status(&self) -> Status {
@@ -429,6 +442,7 @@ impl Vault {
         if status.damage.is_some() {
             return Err(Error::ReadOnly);
         }
+        open.load_for(dir, &ops, now)?;
         let batch = Batch {
             hlc: hlc::next(open.hlc, now),
             ops,
@@ -460,14 +474,18 @@ impl Vault {
     }
 
     /// Whether [`Vault::compact`] has work: deleted or overwritten values to
-    /// remove, a journal in an older format to rewrite (D55), or an earlier
+    /// remove, a journal in an older format to rewrite or years to archive
+    /// (D55), or an earlier
     /// compaction to finish (an old key or file left behind, or a backup copy
     /// of the keyring that couldn't be written). Stays true until that is
     /// done (security review L4).
     pub fn needs_compaction(&self) -> bool {
+        let now = self.config.clock.now_ms();
         self.open.as_ref().is_some_and(|o| {
             o.store.needs_compaction()
                 || o.journal.format != journal::FORMAT
+                || !o.years_to_archive(now).is_empty()
+                || !o.early_archives(now).is_empty()
                 || o.cleanup_pending()
                 || self.status.keyring_backup_stale
         })
@@ -478,11 +496,16 @@ impl Vault {
     /// earlier compaction left.
     pub fn compact(&mut self) -> Result<()> {
         self.finish_compaction()?;
+        let now = self.config.clock.now_ms();
         let open = self.opened()?;
-        if !open.store.needs_compaction() && open.journal.format == journal::FORMAT {
+        let years = open.years_to_archive(now);
+        if !open.store.needs_compaction()
+            && open.journal.format == journal::FORMAT
+            && years.is_empty()
+            && open.early_archives(now).is_empty()
+        {
             return Ok(());
         }
-        let now = self.config.clock.now_ms();
         let dir = &self.dir;
         let status = &mut self.status;
         let open = self.open.as_mut().ok_or(Error::Locked)?;
@@ -494,6 +517,26 @@ impl Vault {
             .checked_add(1)
             .ok_or(Error::Internal("journal generation"))?;
         let key = SecretKey::random(&mut OsRng)?;
+        let hlc = hlc::next(open.hlc, now);
+        let stamp = Stamp {
+            hlc,
+            device: open.keyring.device_id,
+            seq: 0,
+            index: 0,
+        };
+
+        // 0. The archives of the years to archive, each in a new file under a
+        // new key (D55). Until the new journal names them, they are
+        // leftovers that the next unlock or compaction removes.
+        let early = open.early_archives(now);
+        for year in years.iter().chain(early.iter().map(|(y, _)| y)) {
+            open.load(dir, *year, true)?;
+        }
+        let written = archive::write(dir, open, &years, stamp)?;
+        // The key records that go: of the archives rewritten, and of those
+        // whose records return to the journal.
+        let mut dropped = written.replaced.clone();
+        dropped.extend(early.into_iter().map(|(_, id)| id));
 
         // 1. The keyring with both keys (a stale key of an earlier attempt
         // goes). Both copies must hold the new key before the new journal
@@ -522,9 +565,18 @@ impl Vault {
             new,
         );
         let mut bytes = header.to_vec();
-        let hlc = hlc::next(open.hlc, now);
+        let last = archive::last_archived_year(now);
+        let replaced = dropped.clone();
+        let active = open
+            .store
+            .snapshot_where(move |y| y.is_none_or(|y| y > last))
+            .filter(|op| {
+                !matches!(op, Op::Snap { kind, id, .. }
+                    if kind == archive::ARCHIVE_KIND && replaced.contains(id))
+            })
+            .chain(written.ops.iter().cloned());
         let mut seq = 0;
-        for ops in split(open.store.snapshot()) {
+        for ops in split(active) {
             seq += 1;
             let plaintext = journal::encode(journal::FORMAT, &Batch { hlc, ops })?;
             bytes.extend(journal::seal_frame(
@@ -564,7 +616,29 @@ impl Vault {
             next_seq: seq + 1,
         };
         open.hlc = hlc;
+        for (i, id) in dropped.iter().enumerate() {
+            let del = Op::Del {
+                kind: archive::ARCHIVE_KIND.into(),
+                id: id.clone(),
+            };
+            let index = (written.ops.len() + i) as u32;
+            open.store.apply_op(&del, Stamp { index, ..stamp });
+        }
+        for op in &written.ops {
+            if let Op::Snap { alive, .. } = op {
+                open.store.apply_op(op, *alive);
+            }
+        }
         open.store = open.store.compacted();
+        // The journal now holds no changes to archived years: only those the
+        // app asked for stay in memory.
+        let requested = open.requested.clone();
+        open.loaded.retain(|y, _| requested.contains(y));
+        open.loaded
+            .values_mut()
+            .for_each(|changed| *changed = false);
+        open.store
+            .retain_years(move |y| y.is_none_or(|y| y > last || requested.contains(&y)));
 
         // 4. Delete the old key, then the old file. Both copies hold the new
         // key since step 1, so the old file can go even if the backup isn't
@@ -582,6 +656,9 @@ impl Vault {
                 .and_then(|_| dir.sync())
                 .is_err();
         }
+        // The archives this compaction replaced. Best effort: their keys
+        // went with the old journal.
+        let _ = archive::clean_up(dir, open);
         Ok(())
     }
 
@@ -1107,6 +1184,8 @@ fn remove_leftovers(dir: &Dir) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod archive_tests;
 #[cfg(test)]
 mod regression_tests;
 #[cfg(test)]

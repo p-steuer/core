@@ -325,9 +325,20 @@ The plan:
 \begin{itemize}
   \item journal format~2 (above, done): 0.9\,MB a year, and unlock about twice as fast after 25 and 50 years; memory is unchanged;
   \item a compact store in memory (done): kinds and field names kept once, UUIDs in 16 bytes, one stamp per group of fields, values in a small type that can be wiped. After 10 years the store holds 73\,MB instead of 185\,MB, and unlock is twice as fast;
-  \item archive segments per year with their own keys, decrypted on demand, with summary records in the current segment. A year is archived only once it is two years old, so the current and the previous year are always loaded (\dref{D55}).
+  \item archive segments per year (done in the core, below).
 \end{itemize}
-Deleting a record in an archive rewrites that segment under a new key, so crypto-shredding still holds \todo{archive segments}.
+
+\noindent\textbf{Archive segments} (\dref{D55}, \dref{P95}, since 20 October 2026). At compaction, the records of each year that is two years old leave the journal for an archive file of that year; the current and the previous calendar year always stay in the journal. Unlock reads only the journal, so after 50 years of a daily session it adds about 50\,ms and 15\,MB on a desktop.
+\begin{itemize}
+  \item \textbf{A record's year} is the UTC year in which its UUIDv7 identifier was created. Records with other identifiers (fixed ones, the core's own) stay in the journal.
+  \item \textbf{The file} has the journal's layout under the magic \texttt{SCARCHIV}, with the year where a journal has its generation. Its frames are sealed under a key $K_{a}$ of its own, fresh for every version of the file, with the header in the associated data. A frame can't move between archives, years or journals: the key, the magic or the year would differ.
+  \item \textbf{The key} is a field of a record of the core's own kind \texttt{\_archive} in the journal, like the keys of files (\cref{sec:rest}); the keyring is unchanged. A new version of an archive gets a new file and a new key, and the record of the old key is left out of the new journal generation, so the old version is shredded with that generation's key (\dref{P69}).
+  \item \textbf{Changes:} changing or deleting a record of an archived year loads that year first, so the app never sees half a record. The next compaction writes the year again under a new key; a deleted record is then gone from every file that still has a key.
+  \item \textbf{Order of writes:} the new archive files first, then the keyring and the new journal as in every compaction. A crash in between leaves archive files whose keys exist only in memory; files no \texttt{\_archive} record names are removed at unlock and after compaction.
+  \item \textbf{Damage:} an archive that doesn't read is refused as a whole. If the journal holds changes to its year, the vault opens read-only, because compaction would write the year from part of its records.
+  \item \textbf{Clock:} if the clock was ahead and is set back, archives of years that aren't two years old any more are loaded at unlock, and compaction returns their records to the journal.
+\end{itemize}
+Summary records in the journal (bests, estimated 1RMs, weekly volume), kept by the app, are still to come \todo{summary records; how the app shows old years (O27)}.
 
 \noindent\textbf{Nonces, and no encryption in place.} ChaCha20 is a stream cipher. Encrypting two different plaintexts under the same key and nonce would reveal their XOR, and Poly1305 would then allow forgeries. That is the classic problem of data at rest rewritten in place. The core never does it:
 \begin{itemize}
