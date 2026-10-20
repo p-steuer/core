@@ -677,6 +677,7 @@ impl Vault {
         let key = open
             .store
             .field_str(BLOB_KIND, id, "key")
+            .as_deref()
             .and_then(unhex32)
             .ok_or(Error::Damaged("file key"))?;
         let bytes = open
@@ -997,23 +998,21 @@ fn clean_up_blobs(blobs: &Dir, store: &Store) -> Result<()> {
 /// A record too big for one batch becomes several snapshot operations with
 /// some of its fields each; they merge back into the same record (security
 /// review L3: one big record made every compaction fail).
-fn split(ops: Vec<Op>) -> Vec<Vec<Op>> {
-    let mut batches = Vec::new();
-    let mut current = Vec::new();
-    let mut size = 0;
-    for op in ops.into_iter().flat_map(split_record) {
-        let n = codec::op_len(&op);
-        if !current.is_empty() && size + n > SNAPSHOT_BATCH {
-            batches.push(std::mem::take(&mut current));
-            size = 0;
+fn split(ops: impl Iterator<Item = Op>) -> impl Iterator<Item = Vec<Op>> {
+    let mut ops = ops.flat_map(split_record).peekable();
+    std::iter::from_fn(move || {
+        let mut batch = Vec::new();
+        let mut size = 0;
+        while let Some(op) = ops.peek() {
+            let n = codec::op_len(op);
+            if !batch.is_empty() && size + n > SNAPSHOT_BATCH {
+                break;
+            }
+            size += n;
+            batch.extend(ops.next());
         }
-        size += n;
-        current.push(op);
-    }
-    if !current.is_empty() {
-        batches.push(current);
-    }
-    batches
+        (!batch.is_empty()).then_some(batch)
+    })
 }
 
 /// One record's snapshot as parts of at most [`SNAPSHOT_BATCH`] bytes (a

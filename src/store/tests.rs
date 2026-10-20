@@ -144,7 +144,7 @@ fn snapshot_drops_history_but_keeps_state_and_stamps() {
         3,
     );
     s.apply(&batch(4, vec![del("set", "s2")]), DEV_A, 4);
-    let snap = s.snapshot();
+    let snap: Vec<Op> = s.snapshot().collect();
     let text = serde_json::to_string(&snap).unwrap();
     assert!(!text.contains("deleted value"));
     assert!(!text.contains("s2"));
@@ -353,7 +353,7 @@ proptest! {
         prop_assert_eq!(visible(&s.compacted()), visible(&s));
         // Replaying the snapshot through either journal format gives the
         // same, too.
-        let batch = Batch { hlc: 99, ops: s.snapshot() };
+        let batch = Batch { hlc: 99, ops: s.snapshot().collect() };
         for format in [journal::FORMAT_JSON, journal::FORMAT_BINARY] {
             let plaintext = journal::encode(format, &batch).unwrap();
             let mut replayed = Store::default();
@@ -372,4 +372,341 @@ proptest! {
         s.apply_op(&del("set", "a"), last);
         prop_assert_eq!(s.get("set", "a"), None);
     }
+}
+
+// ---- The compact store against MVP 1's (D55 (2)) -------------------------
+
+/// Kind, id, alive stamp and fields of each record in a snapshot.
+type Snapshot = Vec<(String, String, Stamp, Vec<(String, Stamp, Value)>)>;
+
+/// MVP 1's store, kept as the reference: maps of strings and JSON values.
+#[derive(Default)]
+struct Model {
+    records: BTreeMap<(String, String), ModelRecord>,
+}
+
+#[derive(Default)]
+struct ModelRecord {
+    alive: Option<Stamp>,
+    deleted: Option<Stamp>,
+    fields: BTreeMap<String, (Stamp, Value)>,
+}
+
+impl ModelRecord {
+    fn visible(&self) -> bool {
+        match (self.alive, self.deleted) {
+            (Some(a), Some(d)) => a > d,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+
+    fn visible_fields(&self) -> Vec<(String, Stamp, Value)> {
+        self.fields
+            .iter()
+            .filter(|(_, (s, v))| self.deleted.is_none_or(|d| *s > d) && !v.is_null())
+            .map(|(n, (s, v))| (n.clone(), *s, v.clone()))
+            .collect()
+    }
+
+    fn write(&mut self, name: &str, stamp: Stamp, value: &Value) {
+        if self.fields.get(name).is_none_or(|(s, _)| *s < stamp) {
+            self.fields.insert(name.to_owned(), (stamp, value.clone()));
+        }
+    }
+}
+
+impl Model {
+    fn apply_op(&mut self, op: &Op, stamp: Stamp) {
+        match op {
+            Op::Put { kind, id, fields } => {
+                let r = self.records.entry((kind.clone(), id.clone())).or_default();
+                r.alive = r.alive.max(Some(stamp));
+                fields.iter().for_each(|(n, v)| r.write(n, stamp, v));
+            }
+            Op::Del { kind, id } => {
+                let r = self.records.entry((kind.clone(), id.clone())).or_default();
+                r.deleted = r.deleted.max(Some(stamp));
+            }
+            Op::Snap {
+                kind,
+                id,
+                alive,
+                fields,
+            } => {
+                let r = self.records.entry((kind.clone(), id.clone())).or_default();
+                r.alive = r.alive.max(Some(*alive));
+                fields.iter().for_each(|(n, s, v)| r.write(n, *s, v));
+            }
+        }
+    }
+
+    fn records(&self, kind: &str) -> Vec<Record> {
+        self.records
+            .iter()
+            .filter(|((k, _), r)| k == kind && r.visible())
+            .map(|((k, id), r)| Record {
+                kind: k.clone(),
+                id: id.clone(),
+                fields: r
+                    .visible_fields()
+                    .into_iter()
+                    .map(|(n, _, v)| (n, v))
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        self.records
+            .iter()
+            .filter(|(_, r)| r.visible())
+            .map(|((k, id), r)| (k.clone(), id.clone(), r.alive.unwrap(), r.visible_fields()))
+            .collect()
+    }
+
+    fn max_hlc(&self) -> u64 {
+        self.records
+            .values()
+            .flat_map(|r| {
+                r.alive
+                    .iter()
+                    .chain(r.deleted.iter())
+                    .map(|s| s.hlc)
+                    .chain(r.fields.values().map(|(s, _)| s.hlc))
+                    .collect::<Vec<_>>()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+const KINDS: [&str; 3] = ["set", "weight", "_blob"];
+const UUID_A: &str = "0195f4c2-7a1b-7c3d-8e4f-123456789abc";
+const UUID_B: &str = "0195f4c2-7a1b-7c3d-8e4f-12345678a000";
+
+fn arb_rich_id() -> impl Strategy<Value = String> {
+    prop::sample::select(vec![
+        "a",
+        "b",
+        "0195f4c2",
+        "0195f4c2-7a1b-7c3d-8e4f-123456789abcd",
+        UUID_A,
+        UUID_B,
+        "0195F4C2-7A1B-7C3D-8E4F-123456789ABC",
+        "z",
+    ])
+    .prop_map(String::from)
+}
+
+fn arb_rich_value() -> impl Strategy<Value = Value> {
+    prop_oneof![
+        Just(Value::Null),
+        any::<bool>().prop_map(Value::Bool),
+        prop_oneof![Just(0u64), Just(u64::MAX), 0u64..1000].prop_map(Value::from),
+        prop_oneof![Just(i64::MIN), Just(-1i64), -1000i64..0].prop_map(Value::from),
+        prop_oneof![Just(-0.0f64), Just(2.5), Just(5.0), Just(f64::MAX)].prop_map(Value::from),
+        prop::sample::select(vec![
+            "",
+            "x",
+            "Grüße",
+            UUID_A,
+            "0195F4C2-7A1B-7C3D-8E4F-123456789ABC"
+        ])
+        .prop_map(Value::from),
+    ]
+}
+
+fn arb_rich_stamp() -> impl Strategy<Value = Stamp> {
+    (0u64..6, any::<bool>(), 0u64..4, 0u32..3).prop_map(|(hlc, b, seq, index)| Stamp {
+        hlc,
+        device: if b { DEV_B } else { DEV_A },
+        seq,
+        index,
+    })
+}
+
+fn arb_rich_op() -> impl Strategy<Value = Op> {
+    let kind = prop::sample::select(KINDS.to_vec()).prop_map(String::from);
+    let name = prop::sample::select(vec!["reps", "weight_g", "note", "entry", "a9"]);
+    prop_oneof![
+        3 => (kind.clone(), arb_rich_id(), prop::collection::btree_map(name.clone(), arb_rich_value(), 0..5))
+            .prop_map(|(kind, id, f)| Op::Put {
+                kind,
+                id,
+                fields: f.into_iter().map(|(n, v)| (n.to_owned(), v)).collect(),
+            }),
+        1 => (kind.clone(), arb_rich_id()).prop_map(|(kind, id)| Op::Del { kind, id }),
+        2 => (kind, arb_rich_id(), arb_rich_stamp(),
+              prop::collection::vec((name, arb_rich_stamp(), arb_rich_value()), 0..6))
+            .prop_map(|(kind, id, alive, f)| Op::Snap {
+                kind,
+                id,
+                alive,
+                // Repeated names included: only a damaged batch holds them,
+                // and the later stamp must still win.
+                fields: f.into_iter().map(|(n, s, v)| (n.to_owned(), s, v)).collect(),
+            }),
+    ]
+}
+
+/// A snapshot as comparable tuples.
+fn snapshot_of(s: &Store) -> Snapshot {
+    let mut all: Vec<_> = s
+        .snapshot()
+        .map(|op| match &op {
+            Op::Snap {
+                kind,
+                id,
+                alive,
+                fields,
+            } => (kind.clone(), id.clone(), *alive, fields.clone()),
+            _ => unreachable!("snapshots hold snapshot operations"),
+        })
+        .collect();
+    all.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    all
+}
+
+proptest! {
+    #[test]
+    fn the_compact_store_behaves_like_mvp_1s(
+        ops in prop::collection::vec((arb_rich_op(), arb_rich_stamp()), 0..40),
+    ) {
+        let mut s = Store::default();
+        let mut m = Model::default();
+        for (op, stamp) in &ops {
+            s.apply_op(op, *stamp);
+            m.apply_op(op, *stamp);
+        }
+        for kind in KINDS {
+            let records = s.records(kind);
+            prop_assert_eq!(&records, &m.records(kind));
+            let ids: Vec<String> = records.iter().map(|r| r.id.clone()).collect();
+            prop_assert_eq!(s.ids(kind), ids);
+            for r in &records {
+                let got = s.get(kind, &r.id);
+                prop_assert_eq!(got.as_ref(), Some(r));
+                prop_assert!(s.exists(kind, &r.id));
+                for (name, value) in &r.fields {
+                    let text = s.field_str(kind, &r.id, name);
+                    prop_assert_eq!(text.as_deref(), value.as_str());
+                }
+            }
+        }
+        prop_assert_eq!(s.max_hlc(), m.max_hlc());
+        let mut expected = m.snapshot();
+        expected.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        prop_assert_eq!(snapshot_of(&s), expected);
+        prop_assert_eq!(snapshot_of(&s.compacted()), snapshot_of(&s));
+        // No record keeps a stamp none of its fields uses.
+        for r in s.records.values() {
+            for (i, _) in r.stamps.iter().enumerate() {
+                prop_assert!(r.fields.iter().any(|f| f.stamp as usize == i));
+            }
+            prop_assert!(r.fields.windows(2).all(|w| w[0].name < w[1].name));
+        }
+    }
+}
+
+#[test]
+fn ids_sort_as_their_texts_do() {
+    let mut texts = vec![
+        "",
+        "0",
+        "0195f4c2-7a1b-7c3d-8e4f-123456789abc",
+        "0195f4c2-7a1b-7c3d-8e4f-123456789abcd",
+        "0195f4c2-7a1b-7c3d-8e4f-12345678a000",
+        "0195f4c2-ffff-7c3d-8e4f-123456789abc",
+        "0195f4c2-",
+        "0195F4C2-7A1B-7C3D-8E4F-123456789ABC",
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        "g",
+        "a",
+    ];
+    let mut ids: Vec<Id> = texts.iter().map(|t| Id::new(t)).collect();
+    texts.sort();
+    ids.sort();
+    let back: Vec<String> = ids.iter().map(Id::to_text).collect();
+    assert_eq!(back, texts);
+    assert!(matches!(Id::new(UUID_A), Id::Uuid(_)));
+    assert!(matches!(Id::new(&UUID_A.to_uppercase()), Id::Text(_)));
+}
+
+#[test]
+fn values_keep_their_kind() {
+    for v in [
+        json!(null),
+        json!(true),
+        json!(0),
+        json!(u64::MAX),
+        json!(-1),
+        json!(i64::MIN),
+        json!(5.0),
+        json!(-0.0),
+        json!(UUID_A),
+        json!(UUID_A.to_uppercase()),
+        json!("Grüße"),
+    ] {
+        let back = Val::new(&v).to_value();
+        assert_eq!(back, v);
+        assert_eq!(
+            (back.is_u64(), back.is_i64(), back.is_f64()),
+            (v.is_u64(), v.is_i64(), v.is_f64())
+        );
+        assert_eq!(
+            serde_json::to_string(&back).unwrap(),
+            serde_json::to_string(&v).unwrap()
+        );
+    }
+    assert!(matches!(Val::new(&json!(UUID_A)), Val::Uuid(_)));
+}
+
+#[test]
+fn fields_and_stamps_are_small() {
+    assert_eq!(std::mem::size_of::<Val>(), 24);
+    assert_eq!(std::mem::size_of::<Field>(), 32);
+    // A record rewritten whole keeps one stamp, however often.
+    let mut s = Store::default();
+    for i in 0..10u64 {
+        let op = put(
+            "set",
+            UUID_A,
+            json!({"entry": UUID_B, "reps": i, "weight_g": 100000, "note": null}),
+        );
+        s.apply(&batch(i, vec![op]), DEV_A, i);
+    }
+    let r = s.records.values().next().unwrap();
+    assert_eq!((r.stamps.len(), r.fields.len()), (1, 4));
+    assert_eq!(r.fields.capacity(), 4);
+    // Room for the second stamp a rewrite briefly needs, not four.
+    assert!(r.stamps.capacity() <= 2);
+    assert_eq!(s.names.names.len(), 5);
+}
+
+#[test]
+fn growing_a_record_keeps_its_fields() {
+    let mut s = Store::default();
+    for i in 0..40u64 {
+        let op = put("set", "a", json!({ format!("f{i}"): i }));
+        s.apply(&batch(i, vec![op]), DEV_A, i);
+    }
+    let r = s.get("set", "a").unwrap();
+    assert_eq!(r.fields.len(), 40);
+    assert!((0..40u64).all(|i| r.fields[&format!("f{i}")] == i));
+}
+
+#[test]
+fn uuid_values_are_read_as_texts() {
+    let mut s = Store::default();
+    let op = put("_blob", "b", json!({"key": "ab".repeat(32), "of": UUID_A}));
+    s.apply(&batch(1, vec![op]), DEV_A, 1);
+    assert!(matches!(
+        s.field_str("_blob", "b", "key"),
+        Some(Cow::Borrowed(_))
+    ));
+    assert_eq!(s.field_str("_blob", "b", "of").as_deref(), Some(UUID_A));
+    assert_eq!(s.field_str("_blob", "b", "none"), None);
+    s.apply(&batch(2, vec![del("_blob", "b")]), DEV_A, 2);
+    assert_eq!(s.field_str("_blob", "b", "key"), None);
 }

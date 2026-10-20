@@ -698,7 +698,7 @@ fn measure_years_of_daily_sessions() {
     println!("  after compaction ({secs:.2} s): {:.2} MB", journal_mb());
 
     println!(
-        "years | sessions | journal MB | compaction s | unlock ms (minus Argon2id) | RSS MB open"
+        "years | sessions | journal MB | compaction s | unlock ms (minus Argon2id) | MB after unlock | MB peak"
     );
     for years in [1i64, 5, 10, 25, 50] {
         while day < years * 365 {
@@ -706,16 +706,67 @@ fn measure_years_of_daily_sessions() {
             day += 1;
         }
         let secs = compact(&mut v);
-        let open_rss = rss_mb() - base_rss;
         v.lock();
-        let t = Instant::now();
-        v = unlock(dir);
-        let ms = t.elapsed().as_secs_f64() * 1e3 - base_ms;
+        // Unlock in a fresh process, so memory left over from building the
+        // history doesn't count.
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "--nocapture",
+                "vault::store_tests::unlock_probe",
+            ])
+            .env("SC_PROBE_DIR", dir)
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&out.stdout);
+        let probe: Vec<f64> = out
+            .lines()
+            .find_map(|l| l.strip_prefix("PROBE "))
+            .expect("the probe's result")
+            .split(' ')
+            .map(|x| x.parse().unwrap())
+            .collect();
+        let (ms, after, peak) = (probe[0] - base_ms, probe[1], probe[2]);
         println!(
-            "{years:5} | {day:8} | {:10.1} | {secs:12.2} | {ms:26.0} | {open_rss:11.0}",
+            "{years:5} | {day:8} | {:10.1} | {secs:12.2} | {ms:26.0} | {after:15.0} | {peak:7.0}",
             journal_mb()
         );
+        v = unlock(dir);
     }
+    let _ = base_rss;
+}
+
+/// Unlocks the vault in `SC_PROBE_DIR` and prints the time it took, the
+/// memory it holds afterwards and its peak (both above what the process held
+/// before), for [`measure_years_of_daily_sessions`].
+#[test]
+#[ignore]
+fn unlock_probe() {
+    let Some(dir) = std::env::var_os("SC_PROBE_DIR") else {
+        return;
+    };
+    let status = |key: &str| -> f64 {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap();
+        let kb: f64 = s
+            .lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap()
+            .parse()
+            .unwrap();
+        kb / 1e3
+    };
+    let before = status("VmRSS:");
+    let t = std::time::Instant::now();
+    let v = unlock(std::path::Path::new(&dir));
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "PROBE {ms} {} {}",
+        status("VmRSS:") - before,
+        status("VmHWM:") - before
+    );
+    drop(v);
 }
 
 /// A journal in format 1, as MVP 1 wrote it, opens unchanged, keeps taking

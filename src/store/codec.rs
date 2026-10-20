@@ -78,7 +78,7 @@ fn put_text(out: &mut Vec<u8>, s: &str) {
 
 /// The 16 bytes of a text in canonical UUID form: 8-4-4-4-12 lowercase hex
 /// digits.
-fn uuid_bytes(s: &str) -> Option<[u8; 16]> {
+pub(super) fn uuid_bytes(s: &str) -> Option<[u8; 16]> {
     let b = s.as_bytes();
     if b.len() != 36 {
         return None;
@@ -103,16 +103,24 @@ fn uuid_bytes(s: &str) -> Option<[u8; 16]> {
     Some(out)
 }
 
-fn uuid_text(b: &[u8; 16]) -> String {
-    let hex = super::hex16(b);
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..]
-    )
+/// A UUID's canonical text, without allocating.
+pub(super) fn uuid_ascii(b: &[u8; 16]) -> [u8; 36] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [b'-'; 36];
+    let mut at = 0;
+    for (i, x) in b.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            at += 1;
+        }
+        out[at] = HEX[usize::from(x >> 4)];
+        out[at + 1] = HEX[usize::from(x & 15)];
+        at += 2;
+    }
+    out
+}
+
+pub(super) fn uuid_text(b: &[u8; 16]) -> String {
+    uuid_ascii(b).iter().map(|&c| char::from(c)).collect()
 }
 
 fn put_id(out: &mut Vec<u8>, id: &str) {

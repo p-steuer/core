@@ -11,12 +11,14 @@ pub(crate) mod codec;
 pub(crate) mod hlc;
 pub(crate) mod journal;
 
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::de::{self, SeqAccess, Visitor};
 use serde::ser::SerializeTuple;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::{Map, Value};
+use serde_json::{Map, Number, Value};
 use zeroize::Zeroize;
 
 use crate::{Error, Result};
@@ -290,63 +292,316 @@ impl From<Change> for Op {
     }
 }
 
-#[derive(Clone, Default, PartialEq)]
-pub(crate) struct RecordState {
+// ---- The store in memory (D55 (2)) -------------------------------------------
+//
+// Compact, because unlock keeps every record in memory: kinds and field names
+// are kept once and referred to by number, ids and values in UUID form take
+// 16 bytes, and each record's fields sit in one sorted vector that points into
+// the record's few distinct stamps.
+
+/// A kind or a field name, as its number in the store's table of names.
+type Name = u32;
+
+/// The kinds and field names in a store, each kept once.
+#[derive(Clone, Default)]
+struct Names {
+    names: Vec<Box<str>>,
+    numbers: HashMap<Box<str>, Name>,
+}
+
+impl Names {
+    fn intern(&mut self, s: &str) -> Name {
+        if let Some(&n) = self.numbers.get(s) {
+            return n;
+        }
+        let n = self.names.len() as Name;
+        self.names.push(s.into());
+        self.numbers.insert(s.into(), n);
+        n
+    }
+
+    fn find(&self, s: &str) -> Option<Name> {
+        self.numbers.get(s).copied()
+    }
+
+    fn get(&self, n: Name) -> &str {
+        &self.names[n as usize]
+    }
+}
+
+/// A record id: a UUID in canonical form takes 16 bytes, any other id is kept
+/// as text. Ids sort as their texts do.
+#[derive(Clone, PartialEq, Eq)]
+enum Id {
+    Uuid([u8; 16]),
+    Text(Box<str>),
+}
+
+impl Id {
+    fn new(s: &str) -> Id {
+        codec::uuid_bytes(s).map_or_else(|| Id::Text(s.into()), Id::Uuid)
+    }
+
+    /// The smallest id, where the records of a kind begin.
+    fn first() -> Id {
+        Id::Text(Box::default())
+    }
+
+    fn with_text<R>(&self, f: impl FnOnce(&str) -> R) -> R {
+        match self {
+            Id::Uuid(b) => f(std::str::from_utf8(&codec::uuid_ascii(b)).expect("ASCII")),
+            Id::Text(s) => f(s),
+        }
+    }
+
+    fn to_text(&self) -> String {
+        self.with_text(str::to_owned)
+    }
+}
+
+impl Ord for Id {
+    fn cmp(&self, other: &Id) -> Ordering {
+        match (self, other) {
+            // Hex digits sort like the bytes they stand for.
+            (Id::Uuid(a), Id::Uuid(b)) => a.cmp(b),
+            (Id::Text(a), Id::Text(b)) => a.cmp(b),
+            _ => self.with_text(|a| other.with_text(|b| a.cmp(b))),
+        }
+    }
+}
+
+impl PartialOrd for Id {
+    fn partial_cmp(&self, other: &Id) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// A field value. Smaller than a JSON value, and every kind can be wiped.
+#[derive(Clone, PartialEq)]
+enum Val {
+    Null,
+    Bool(bool),
+    Uint(u64),
+    /// Negative only: non-negative integers are `Uint`, as in JSON.
+    Int(i64),
+    Float(f64),
+    Text(Box<str>),
+    /// A text in canonical UUID form, usually another record's id.
+    Uuid([u8; 16]),
+}
+
+impl Val {
+    fn new(v: &Value) -> Val {
+        match v {
+            Value::Null => Val::Null,
+            Value::Bool(b) => Val::Bool(*b),
+            Value::Number(n) => match (n.as_u64(), n.as_i64()) {
+                (Some(u), _) => Val::Uint(u),
+                (None, Some(i)) => Val::Int(i),
+                (None, None) => n.as_f64().map_or(Val::Null, Val::Float),
+            },
+            Value::String(s) => {
+                codec::uuid_bytes(s).map_or_else(|| Val::Text(s.as_str().into()), Val::Uuid)
+            }
+            // Validation, and both journal formats, keep fields flat.
+            Value::Array(_) | Value::Object(_) => Val::Null,
+        }
+    }
+
+    fn to_value(&self) -> Value {
+        match self {
+            Val::Null => Value::Null,
+            Val::Bool(b) => Value::Bool(*b),
+            Val::Uint(u) => Value::from(*u),
+            Val::Int(i) => Value::from(*i),
+            Val::Float(f) => Number::from_f64(*f).map_or(Value::Null, Value::Number),
+            Val::Text(s) => Value::String(s.to_string()),
+            Val::Uuid(b) => Value::String(codec::uuid_text(b)),
+        }
+    }
+
+    fn wipe(&mut self) {
+        match self {
+            Val::Null => {}
+            Val::Bool(b) => b.zeroize(),
+            Val::Uint(u) => u.zeroize(),
+            Val::Int(i) => i.zeroize(),
+            Val::Float(f) => f.zeroize(),
+            Val::Text(s) => s.zeroize(),
+            Val::Uuid(b) => b.zeroize(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Field {
+    name: Name,
+    /// The field's place in its record's stamps.
+    stamp: u32,
+    value: Val,
+}
+
+#[derive(Clone, Default)]
+struct Rec {
     /// The latest put or snapshot.
     alive: Option<Stamp>,
-    /// The latest deletion.
-    deleted: Option<Stamp>,
-    fields: BTreeMap<String, (Stamp, Value)>,
+    /// The latest deletion; boxed, as few records have one.
+    deleted: Option<Box<Stamp>>,
+    /// The stamps the fields were written with, each once.
+    stamps: Vec<Stamp>,
+    /// Sorted by name.
+    fields: Vec<Field>,
 }
 
-impl Drop for RecordState {
+impl Drop for Rec {
     fn drop(&mut self) {
-        self.fields.values_mut().for_each(|(_, v)| wipe(v));
+        self.fields.iter_mut().for_each(|f| f.value.wipe());
     }
 }
 
-impl std::fmt::Debug for RecordState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RecordState")
-            .field("alive", &self.alive)
-            .field("deleted", &self.deleted)
-            .field("fields", &field_names(self.fields.keys()))
-            .finish()
-    }
-}
-
-impl RecordState {
+impl Rec {
     fn visible(&self) -> bool {
-        match (self.alive, self.deleted) {
-            (Some(a), Some(d)) => a > d,
+        match (self.alive, self.deleted.as_deref()) {
+            (Some(a), Some(d)) => a > *d,
             (Some(_), None) => true,
             (None, _) => false,
         }
     }
 
-    fn visible_fields(&self) -> impl Iterator<Item = (&String, &Stamp, &Value)> {
-        let deleted = self.deleted;
+    fn visible_fields(&self) -> impl Iterator<Item = (&Field, &Stamp)> {
+        let deleted = self.deleted.as_deref().copied();
         self.fields
             .iter()
-            .filter(move |(_, (s, v))| deleted.is_none_or(|d| *s > d) && !v.is_null())
-            .map(|(n, (s, v))| (n, s, v))
+            .map(|f| (f, &self.stamps[f.stamp as usize]))
+            .filter(move |(f, s)| deleted.is_none_or(|d| **s > d) && f.value != Val::Null)
     }
 
-    fn write_field(&mut self, name: &str, stamp: Stamp, value: &Value) {
-        match self.fields.get(name) {
-            Some((s, _)) if *s >= stamp => {}
-            _ => {
-                self.fields.insert(name.to_owned(), (stamp, value.clone()));
+    fn field(&self, name: Name) -> Option<&Field> {
+        let i = self.fields.binary_search_by_key(&name, |f| f.name).ok()?;
+        Some(&self.fields[i])
+    }
+
+    /// Writes one operation's fields, each where it is newer than what the
+    /// record holds, then forgets the stamps no field uses any more.
+    fn write(&mut self, writes: &[(Name, Stamp, &Value)]) {
+        let held = self.fields.len();
+        let find =
+            |fields: &[Field], name: Name| fields[..held].binary_search_by_key(&name, |f| f.name);
+        let new = writes
+            .iter()
+            .filter(|(n, ..)| find(&self.fields, *n).is_err())
+            .count();
+        self.reserve(new);
+        let mut replaced = false;
+        for &(name, stamp, value) in writes {
+            match find(&self.fields, name) {
+                Ok(i) => {
+                    if self.stamps[self.fields[i].stamp as usize] >= stamp {
+                        continue;
+                    }
+                    let s = self.stamp_number(stamp);
+                    let f = &mut self.fields[i];
+                    f.value.wipe();
+                    f.value = Val::new(value);
+                    f.stamp = s;
+                    replaced = true;
+                }
+                Err(_) => {
+                    let s = self.stamp_number(stamp);
+                    self.fields.push(Field {
+                        name,
+                        stamp: s,
+                        value: Val::new(value),
+                    });
+                }
             }
+        }
+        if self.fields.len() > held {
+            // In place: a stable sort would copy fields into a buffer it frees
+            // unwiped.
+            self.fields.sort_unstable_by_key(|f| f.name);
+            // The same new name twice (only a damaged batch could hold that):
+            // the later stamp wins, as for any other write.
+            let stamps = &self.stamps;
+            let before = self.fields.len();
+            self.fields.dedup_by(|later, kept| {
+                if later.name != kept.name {
+                    return false;
+                }
+                if stamps[later.stamp as usize] > stamps[kept.stamp as usize] {
+                    std::mem::swap(later, kept);
+                }
+                later.value.wipe();
+                true
+            });
+            replaced |= self.fields.len() < before;
+        }
+        if replaced {
+            self.forget_unused_stamps();
+        }
+    }
+
+    /// Room for `more` fields. Growing copies the fields into a new buffer and
+    /// wipes the old one, which `Vec` would free as it is.
+    fn reserve(&mut self, more: usize) {
+        let needed = self.fields.len() + more;
+        if needed <= self.fields.capacity() {
+            return;
+        }
+        let capacity = if self.fields.is_empty() {
+            needed
+        } else {
+            needed.max(self.fields.len() + self.fields.len() / 2)
+        };
+        let mut grown = Vec::with_capacity(capacity);
+        grown.extend(self.fields.iter().cloned());
+        let mut old = std::mem::replace(&mut self.fields, grown);
+        old.iter_mut().for_each(|f| f.value.wipe());
+    }
+
+    /// A stamp's place in `stamps`, added if new. Records hold few distinct
+    /// stamps, and the last one is checked first.
+    fn stamp_number(&mut self, stamp: Stamp) -> u32 {
+        if self.stamps.last() != Some(&stamp) {
+            match self.stamps.iter().position(|s| *s == stamp) {
+                Some(i) => return i as u32,
+                None => {
+                    // Exactly: most records keep a single stamp, and `push`
+                    // would make room for four.
+                    self.stamps.reserve_exact(1);
+                    self.stamps.push(stamp);
+                }
+            }
+        }
+        (self.stamps.len() - 1) as u32
+    }
+
+    fn forget_unused_stamps(&mut self) {
+        let mut number = vec![u32::MAX; self.stamps.len()];
+        for f in &self.fields {
+            number[f.stamp as usize] = 0;
+        }
+        let mut kept = 0;
+        for (i, n) in number.iter_mut().enumerate() {
+            if *n == 0 {
+                self.stamps[kept] = self.stamps[i];
+                *n = kept as u32;
+                kept += 1;
+            }
+        }
+        self.stamps.truncate(kept);
+        for f in &mut self.fields {
+            f.stamp = number[f.stamp as usize];
         }
     }
 }
 
 /// All records in memory, rebuilt from the journal at unlock. Dropping it
-/// (when the vault locks) wipes the texts.
-#[derive(Clone, Default, PartialEq)]
+/// (when the vault locks) wipes the values.
+#[derive(Clone, Default)]
 pub(crate) struct Store {
-    records: BTreeMap<(String, String), RecordState>,
+    names: Names,
+    records: BTreeMap<(Name, Id), Rec>,
     /// Field writes since the last compaction, for deciding when to compact.
     writes: u64,
     deletes: u64,
@@ -376,19 +631,28 @@ impl Store {
         }
     }
 
+    fn record_mut(&mut self, kind: &str, id: &str) -> &mut Rec {
+        let kind = self.names.intern(kind);
+        self.records.entry((kind, Id::new(id))).or_default()
+    }
+
     pub(crate) fn apply_op(&mut self, op: &Op, stamp: Stamp) {
         match op {
             Op::Put { kind, id, fields } => {
-                let r = self.records.entry((kind.clone(), id.clone())).or_default();
+                let writes: Vec<_> = fields
+                    .iter()
+                    .map(|(n, v)| (self.names.intern(n), stamp, v))
+                    .collect();
+                let r = self.record_mut(kind, id);
                 r.alive = r.alive.max(Some(stamp));
-                for (name, value) in fields {
-                    r.write_field(name, stamp, value);
-                }
+                r.write(&writes);
                 self.writes += fields.len() as u64;
             }
             Op::Del { kind, id } => {
-                let r = self.records.entry((kind.clone(), id.clone())).or_default();
-                r.deleted = r.deleted.max(Some(stamp));
+                let r = self.record_mut(kind, id);
+                if r.deleted.as_deref().is_none_or(|d| *d < stamp) {
+                    r.deleted = Some(Box::new(stamp));
+                }
                 self.deletes += 1;
             }
             Op::Snap {
@@ -397,71 +661,85 @@ impl Store {
                 alive,
                 fields,
             } => {
-                let r = self.records.entry((kind.clone(), id.clone())).or_default();
+                let writes: Vec<_> = fields
+                    .iter()
+                    .map(|(n, s, v)| (self.names.intern(n), *s, v))
+                    .collect();
+                let r = self.record_mut(kind, id);
                 r.alive = r.alive.max(Some(*alive));
-                for (name, s, value) in fields {
-                    r.write_field(name, *s, value);
-                }
+                r.write(&writes);
                 self.writes += fields.len() as u64;
             }
         }
     }
 
+    fn rec(&self, kind: &str, id: &str) -> Option<&Rec> {
+        let kind = self.names.find(kind)?;
+        self.records.get(&(kind, Id::new(id)))
+    }
+
+    /// The records of one kind, in id order.
+    fn kind(&self, kind: &str) -> impl Iterator<Item = (&Id, &Rec)> {
+        let k = self.names.find(kind);
+        k.into_iter().flat_map(move |k| {
+            self.records
+                .range((k, Id::first())..)
+                .take_while(move |((n, _), _)| *n == k)
+                .map(|((_, id), r)| (id, r))
+        })
+    }
+
+    fn record(&self, kind: &str, id: String, r: &Rec) -> Record {
+        Record {
+            kind: kind.to_owned(),
+            id,
+            fields: r
+                .visible_fields()
+                .map(|(f, _)| (self.names.get(f.name).to_owned(), f.value.to_value()))
+                .collect(),
+        }
+    }
+
     /// The visible records of one kind, sorted by id.
     pub(crate) fn records(&self, kind: &str) -> Vec<Record> {
-        self.records
-            .range((kind.to_owned(), String::new())..)
-            .take_while(|((k, _), _)| k == kind)
+        self.kind(kind)
             .filter(|(_, r)| r.visible())
-            .map(|((k, id), r)| Record {
-                kind: k.clone(),
-                id: id.clone(),
-                fields: r
-                    .visible_fields()
-                    .map(|(n, _, v)| (n.clone(), v.clone()))
-                    .collect(),
-            })
+            .map(|(id, r)| self.record(kind, id.to_text(), r))
             .collect()
     }
 
     pub(crate) fn get(&self, kind: &str, id: &str) -> Option<Record> {
-        let r = self.records.get(&(kind.to_owned(), id.to_owned()))?;
-        r.visible().then(|| Record {
-            kind: kind.to_owned(),
-            id: id.to_owned(),
-            fields: r
-                .visible_fields()
-                .map(|(n, _, v)| (n.clone(), v.clone()))
-                .collect(),
-        })
+        let r = self.rec(kind, id)?;
+        r.visible().then(|| self.record(kind, id.to_owned(), r))
     }
 
     /// Whether a visible record exists, without copying it.
     pub(crate) fn exists(&self, kind: &str, id: &str) -> bool {
-        self.records
-            .get(&(kind.to_owned(), id.to_owned()))
-            .is_some_and(RecordState::visible)
+        self.rec(kind, id).is_some_and(Rec::visible)
     }
 
-    /// One visible text field, borrowed rather than copied (for the core's
-    /// file keys, which shouldn't be duplicated in memory).
-    pub(crate) fn field_str(&self, kind: &str, id: &str, field: &str) -> Option<&str> {
-        let r = self.records.get(&(kind.to_owned(), id.to_owned()))?;
-        if !r.visible() {
+    /// One visible text field, borrowed rather than copied when it is kept
+    /// as text (for the core's file keys, which shouldn't be duplicated in
+    /// memory).
+    pub(crate) fn field_str(&self, kind: &str, id: &str, field: &str) -> Option<Cow<'_, str>> {
+        let r = self.rec(kind, id).filter(|r| r.visible())?;
+        let f = r.field(self.names.find(field)?)?;
+        let stamp = r.stamps[f.stamp as usize];
+        if r.deleted.as_deref().is_some_and(|d| stamp <= *d) {
             return None;
         }
-        r.visible_fields()
-            .find(|(n, _, _)| n.as_str() == field)
-            .and_then(|(_, _, v)| v.as_str())
+        match &f.value {
+            Val::Text(s) => Some(Cow::Borrowed(s)),
+            Val::Uuid(b) => Some(Cow::Owned(codec::uuid_text(b))),
+            _ => None,
+        }
     }
 
     /// The ids of the visible records of one kind, sorted.
     pub(crate) fn ids(&self, kind: &str) -> Vec<String> {
-        self.records
-            .range((kind.to_owned(), String::new())..)
-            .take_while(|((k, _), _)| k == kind)
+        self.kind(kind)
             .filter(|(_, r)| r.visible())
-            .map(|((_, id), _)| id.clone())
+            .map(|(id, _)| id.to_text())
             .collect()
     }
 
@@ -472,30 +750,34 @@ impl Store {
             .flat_map(|r| {
                 r.alive
                     .iter()
-                    .chain(r.deleted.iter())
+                    .chain(r.deleted.as_deref())
+                    .chain(r.stamps.iter())
                     .map(|s| s.hlc)
-                    .chain(r.fields.values().map(|(s, _)| s.hlc))
             })
             .max()
             .unwrap_or(0)
     }
 
-    /// The surviving state as snapshot operations, for compaction: deleted
-    /// records and overwritten or deleted values are left out.
-    pub(crate) fn snapshot(&self) -> Vec<Op> {
+    /// The surviving state as snapshot operations, one record at a time, for
+    /// compaction: deleted records and overwritten or deleted values are left
+    /// out.
+    pub(crate) fn snapshot(&self) -> impl Iterator<Item = Op> + '_ {
         self.records
             .iter()
             .filter(|(_, r)| r.visible())
-            .map(|((kind, id), r)| Op::Snap {
-                kind: kind.clone(),
-                id: id.clone(),
-                alive: r.alive.expect("visible records are alive"),
-                fields: r
+            .map(|((kind, id), r)| {
+                let mut fields: Vec<(String, Stamp, Value)> = r
                     .visible_fields()
-                    .map(|(n, s, v)| (n.clone(), *s, v.clone()))
-                    .collect(),
+                    .map(|(f, s)| (self.names.get(f.name).to_owned(), *s, f.value.to_value()))
+                    .collect();
+                fields.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                Op::Snap {
+                    kind: self.names.get(*kind).to_owned(),
+                    id: id.to_text(),
+                    alive: r.alive.expect("visible records are alive"),
+                    fields,
+                }
             })
-            .collect()
     }
 
     /// The store as rebuilt from a snapshot: same records, no history.

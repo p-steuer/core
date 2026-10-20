@@ -204,14 +204,14 @@ fn l2_debug_output_holds_no_keys_and_no_texts() {
         .store
         .field_str(BLOB_KIND, &id, "key")
         .unwrap()
-        .to_owned();
+        .into_owned();
     let record = v.record("set", "s").unwrap().unwrap();
     let change = put("set", "s", json!({"note": marker}));
     for shown in [
         format!("{:?}", open.store),
         format!("{record:?}"),
         format!("{change:?}"),
-        format!("{:?}", open.store.snapshot()),
+        format!("{:?}", open.store.snapshot().collect::<Vec<_>>()),
         format!("{:?}", open.keyring),
     ] {
         assert!(!shown.contains(&key), "{shown}");
