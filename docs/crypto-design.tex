@@ -159,7 +159,7 @@ Randomness & The operating system's CSPRNG & \texttt{getrandom} 0.4.3 \\
   \item \textbf{Optional secret key} (\dref{P18}): \todo{decide}.
 \end{enumerate}
 
-\noindent\textbf{Key handling (memory)}: keys exist only inside the core; the user interface receives opaque handles. Every 256-bit key is a \texttt{SecretKey} on the heap (so moves leave no stack copies) and is wiped when dropped (\texttt{zeroize}); decrypted plaintext comes back in wiped buffers, a batch's plaintext is encoded into a buffer reserved at its final size (padding included, so no reallocation leaves a copy behind; fixed 19 October 2026), and the texts of the records held in memory (including the core's file keys) are overwritten when the vault locks; Debug output shows names but never values, keys, salts or commitments (security review of M8). Argon2id's 64\,MiB work area is supplied by the core and wiped after each hash, because \texttt{argon2} 0.6.0's own \texttt{hash\_password\_into} frees it without wiping (its \texttt{block.rs}, checked 18 Oct 2026). \emph{Not} wiped: the copies of the passphrase and the recovery key in Dart and in the bridge's transfer buffers, the records the app has received in Dart, numbers inside the core's records, and zxcvbn's internal copies during the strength check (HMAC and SHA-256 states are wiped since M8, through their \texttt{zeroize} features). Memory locking (\texttt{mlock}) is not used yet.
+\noindent\textbf{Key handling (memory)}: keys exist only inside the core; the user interface receives opaque handles. Every 256-bit key is a \texttt{SecretKey} on the heap (so moves leave no stack copies) and is wiped when dropped (\texttt{zeroize}); decrypted plaintext comes back in wiped buffers, a batch's plaintext is encoded into a buffer reserved at its final size (padding included, so no reallocation leaves a copy behind; fixed 19 October 2026), and the values of the records held in memory (texts, numbers and UUIDs, including the core's file keys) are overwritten when the vault locks, as is the old copy of a record's fields when they grow (\dref{D55}); Debug output shows names but never values, keys, salts or commitments (security review of M8). Argon2id's 64\,MiB work area is supplied by the core and wiped after each hash, because \texttt{argon2} 0.6.0's own \texttt{hash\_password\_into} frees it without wiping (its \texttt{block.rs}, checked 18 Oct 2026). \emph{Not} wiped: the copies of the passphrase and the recovery key in Dart and in the bridge's transfer buffers, the records the app has received in Dart, and zxcvbn's internal copies during the strength check (HMAC and SHA-256 states are wiped since M8, through their \texttt{zeroize} features). Memory locking (\texttt{mlock}) is not used yet.
 
 \section{Passphrases}
 \label{sec:passphrase}
@@ -316,7 +316,7 @@ A frame is $\AEAD.\Enc(K_{j,g}, n, \mathit{batch}, \mathit{header} \concat \ell 
 \end{itemize}
 The format sits in the header, and the header is part of every frame's associated data, so a frame can't move to a file of the other format. Unlock reads both formats. A file keeps its format for appends, and a journal in format~1 makes compaction due, which rewrites it in format~2. Tests: round trips (also as property tests), the size bound used to split compaction batches, a golden file, refusal of every truncation and malformed field, random and damaged inputs without panics, and the migration from format~1.
 
-\noindent\textbf{Growth over decades} (measured 19 October 2026, \dref{D55}). The journal stays close to the live data thanks to compaction, but unlock replays all of it into memory. With format~1, one strength session a day gave 8\,MB a year. After 10 years that meant 0.6\,s more to unlock and 365\,MB of memory in the core on a desktop; after 50 years, 3.1\,s and 1.9\,GB. Two causes:
+\noindent\textbf{Growth over decades} (measured 19 October 2026, \dref{D55}). The journal stays close to the live data thanks to compaction, but unlock replays all of it into memory. With format~1, one strength session a day gave 8\,MB a year. After 10 years that meant 0.6\,s more to unlock on a desktop, and a store of 185\,MB in memory; after 50 years, 3.1\,s and 874\,MB (store sizes measured after unlock in a fresh process; the store is the same for both formats). Two causes:
 \begin{itemize}
   \item every field carried its own merge stamp (about 70 bytes of JSON);
   \item the whole history is kept in memory.
@@ -324,10 +324,10 @@ The format sits in the header, and the header is part of every frame's associate
 The plan:
 \begin{itemize}
   \item journal format~2 (above, done): 0.9\,MB a year, and unlock about twice as fast after 25 and 50 years; memory is unchanged;
-  \item a compact store in memory;
+  \item a compact store in memory (done): kinds and field names kept once, UUIDs in 16 bytes, one stamp per group of fields, values in a small type that can be wiped. After 10 years the store holds 73\,MB instead of 185\,MB, and unlock is twice as fast;
   \item archive segments per year with their own keys, decrypted on demand, with summary records in the current segment. A year is archived only once it is two years old, so the current and the previous year are always loaded (\dref{D55}).
 \end{itemize}
-Deleting a record in an archive rewrites that segment under a new key, so crypto-shredding still holds \todo{the compact store and archive segments}.
+Deleting a record in an archive rewrites that segment under a new key, so crypto-shredding still holds \todo{archive segments}.
 
 \noindent\textbf{Nonces, and no encryption in place.} ChaCha20 is a stream cipher. Encrypting two different plaintexts under the same key and nonce would reveal their XOR, and Poly1305 would then allow forgeries. That is the classic problem of data at rest rewritten in place. The core never does it:
 \begin{itemize}
