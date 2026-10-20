@@ -1,11 +1,16 @@
-//! The journal file, format 1: an append-only sequence of encrypted batches
-//! (P59). One file per generation, `journal-00000001.log` and so on; each
-//! generation has its own key (P69).
+//! The journal file: an append-only sequence of encrypted batches (P59).
+//! One file per generation, `journal-00000001.log` and so on; each generation
+//! has its own key (P69).
 //!
 //! ```text
 //! header (32 bytes): magic "SCJOURNL" | format u16 | suite u16 | vault_id [16] | generation u32
 //! frames, each: length u32 | !length u32 | kind u8 (1 = batch) | device_id [16] | seq u64 | nonce [24] | ciphertext
 //! ```
+//!
+//! The format says how the plaintext of a frame encodes its batch: 1 is JSON
+//! padded with spaces, 2 the binary encoding of [`super::codec`] padded with
+//! zeros (D55). Both are read; new files are written in format 2, and a file
+//! keeps its format until compaction rewrites it.
 //!
 //! `length` counts everything after the two length fields; `!length` is its
 //! bitwise complement. A frame's associated data is the file header followed
@@ -22,13 +27,19 @@
 
 use zeroize::Zeroizing;
 
+use super::{Batch, codec};
 use crate::crypto::SecretKey;
 use crate::crypto::aead::{self, NONCE_LEN, TAG_LEN};
 use crate::rand::Rng;
 use crate::{Error, Result};
 
 const MAGIC: &[u8; 8] = b"SCJOURNL";
-const FORMAT: u16 = 1;
+/// Batches as JSON, padded with spaces (MVP 1).
+pub(crate) const FORMAT_JSON: u16 = 1;
+/// Batches in the binary encoding of [`codec`], padded with zeros (D55).
+pub(crate) const FORMAT_BINARY: u16 = 2;
+/// The format new journal files are written in.
+pub(crate) const FORMAT: u16 = FORMAT_BINARY;
 pub(crate) const HEADER_LEN: usize = 32;
 const KIND_BATCH: u8 = 1;
 /// The two length fields.
@@ -37,8 +48,8 @@ const LENGTHS: usize = 8;
 const FIXED: usize = 1 + 16 + 8 + NONCE_LEN;
 pub(crate) const MAX_PLAINTEXT: usize = 1024 * 1024;
 const MAX_FRAME: usize = FIXED + MAX_PLAINTEXT + TAG_LEN;
-/// Plaintexts are padded to a multiple of this (with JSON whitespace), so
-/// frame sizes say less about their content.
+/// Plaintexts are padded to a multiple of this, so frame sizes say less
+/// about their content.
 const PAD: usize = 128;
 
 pub(crate) type Header = [u8; HEADER_LEN];
@@ -55,20 +66,64 @@ pub(crate) fn generation_of(name: &str) -> Option<u32> {
     digits.parse().ok().filter(|g| *g > 0)
 }
 
-pub(crate) fn header(suite: u16, vault_id: &[u8; 16], generation: u32) -> Header {
+pub(crate) fn header(format: u16, suite: u16, vault_id: &[u8; 16], generation: u32) -> Header {
     let mut h = [0u8; HEADER_LEN];
     h[..8].copy_from_slice(MAGIC);
-    h[8..10].copy_from_slice(&FORMAT.to_le_bytes());
+    h[8..10].copy_from_slice(&format.to_le_bytes());
     h[10..12].copy_from_slice(&suite.to_le_bytes());
     h[12..28].copy_from_slice(vault_id);
     h[28..32].copy_from_slice(&generation.to_le_bytes());
     h
 }
 
-/// Pads with spaces, which JSON ignores at the end.
-pub(crate) fn pad(plaintext: &mut Zeroizing<Vec<u8>>) {
+/// A batch as the plaintext of a frame in a file of `format`, padded: JSON
+/// with spaces, which it ignores at the end, the binary encoding with zeros.
+/// The buffer has room for the padding from the start: growing it would
+/// leave a copy of the plaintext behind in freed memory, unwiped.
+pub(crate) fn encode(format: u16, batch: &Batch) -> Result<Zeroizing<Vec<u8>>> {
+    let failed = |_| Error::Internal("encoding a batch");
+    let (bound, fill) = match format {
+        FORMAT_JSON => (json_len(batch).map_err(failed)?, b' '),
+        FORMAT_BINARY => (codec::len_bound(batch), 0),
+        _ => return Err(Error::Internal("journal format")),
+    };
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(bound.div_ceil(PAD) * PAD));
+    if format == FORMAT_JSON {
+        serde_json::to_writer(&mut *plaintext, batch).map_err(failed)?;
+    } else {
+        codec::encode_into(batch, &mut plaintext)?;
+    }
     let target = plaintext.len().div_ceil(PAD) * PAD;
-    plaintext.resize(target, b' ');
+    plaintext.resize(target, fill);
+    Ok(plaintext)
+}
+
+/// The length of a batch as JSON, counted without writing it anywhere.
+fn json_len(batch: &Batch) -> serde_json::Result<usize> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0 += b.len();
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, batch)?;
+    Ok(count.0)
+}
+
+/// The batch in the plaintext of a frame in a file of `format`.
+pub(crate) fn decode(format: u16, plaintext: &[u8]) -> Result<Batch> {
+    match format {
+        FORMAT_JSON => {
+            serde_json::from_slice(plaintext).map_err(|_| Error::Damaged("journal batch"))
+        }
+        FORMAT_BINARY => codec::decode(plaintext),
+        _ => Err(Error::Unsupported("journal format")),
+    }
 }
 
 /// One encrypted frame, ready to append.
@@ -109,6 +164,9 @@ pub(crate) enum End {
 }
 
 pub(crate) struct Contents {
+    /// The file's format, and its header (with that format).
+    pub format: u16,
+    pub header: Header,
     /// Decrypted plaintexts, in order, with their sequence numbers.
     pub frames: Vec<(u64, Zeroizing<Vec<u8>>)>,
     pub end: End,
@@ -117,29 +175,32 @@ pub(crate) struct Contents {
 impl std::fmt::Debug for Contents {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Contents")
+            .field("format", &self.format)
             .field("frames", &self.frames.len())
             .field("end", &self.end)
             .finish()
     }
 }
 
-/// Reads a whole journal file. `None` for the header means the file isn't
-/// this vault's journal of this generation.
+/// Reads a whole journal file of either format. `expected` is this vault's
+/// header for the generation; only its format may differ from the file's.
 pub(crate) fn read(
     bytes: &[u8],
     key: &SecretKey,
-    header: &Header,
+    expected: &Header,
     device: &[u8; 16],
 ) -> Result<Contents> {
     if bytes.len() < HEADER_LEN || bytes[..8] != MAGIC[..] {
         return Err(Error::Damaged("journal header"));
     }
-    if u16::from_le_bytes([bytes[8], bytes[9]]) != FORMAT {
+    let format = u16::from_le_bytes([bytes[8], bytes[9]]);
+    if format != FORMAT_JSON && format != FORMAT_BINARY {
         return Err(Error::Unsupported("journal format"));
     }
-    if bytes[..HEADER_LEN] != header[..] {
+    if bytes[10..HEADER_LEN] != expected[10..] {
         return Err(Error::Damaged("journal header"));
     }
+    let header: Header = bytes[..HEADER_LEN].try_into().expect("32 bytes");
     let mut frames = Vec::new();
     let mut pos = HEADER_LEN;
     let end = loop {
@@ -193,7 +254,12 @@ pub(crate) fn read(
             Err(_) => break End::Damaged(at, "frame doesn't decrypt"),
         }
     };
-    Ok(Contents { frames, end })
+    Ok(Contents {
+        format,
+        header,
+        frames,
+        end,
+    })
 }
 
 #[cfg(test)]
@@ -208,7 +274,7 @@ mod tests {
     }
 
     fn file(n: usize) -> (Header, Vec<u8>) {
-        let h = header(1, &[9; 16], 1);
+        let h = header(FORMAT_JSON, 1, &[9; 16], 1);
         let mut rng = TestRng::new("journal");
         let mut bytes = h.to_vec();
         for seq in 1..=n as u64 {
@@ -258,16 +324,107 @@ mod tests {
         assert_eq!(empty.end, End::Clean);
     }
 
+    fn batch() -> Batch {
+        Batch {
+            hlc: 7,
+            ops: vec![super::super::Op::Put {
+                kind: "set".into(),
+                id: "a".into(),
+                fields: serde_json::json!({"reps": 5, "note": "x"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            }],
+        }
+    }
+
     #[test]
-    fn padding_keeps_json_valid() {
-        let mut p = Zeroizing::new(b"{\"a\":1}".to_vec());
-        pad(&mut p);
-        assert_eq!(p.len(), 128);
-        let v: serde_json::Value = serde_json::from_slice(&p).unwrap();
-        assert_eq!(v["a"], 1);
-        let mut exact = Zeroizing::new(vec![b' '; 256]);
-        pad(&mut exact);
-        assert_eq!(exact.len(), 256);
+    fn padding_keeps_both_formats_readable() {
+        for format in [FORMAT_JSON, FORMAT_BINARY] {
+            let p = encode(format, &batch()).unwrap();
+            assert_eq!(p.len() % PAD, 0, "format {format}");
+            assert_eq!(decode(format, &p).unwrap(), batch(), "format {format}");
+        }
+        let json = encode(FORMAT_JSON, &batch()).unwrap();
+        assert!(json.ends_with(b" "));
+        let binary = encode(FORMAT_BINARY, &batch()).unwrap();
+        assert!(binary.ends_with(&[0]));
+        // Both pad to whole blocks; the real comparison is in the codec's tests.
+        assert!(binary.len() <= json.len());
+        assert_eq!(
+            decode(3, &binary),
+            Err(Error::Unsupported("journal format"))
+        );
+    }
+
+    /// Regression (19 Oct 2026): padding could grow the plaintext's buffer
+    /// beyond what was reserved, and JSON was written into a growing buffer.
+    /// Each reallocation left a copy of the plaintext in freed memory,
+    /// unwiped. Now the buffer has its final size from the start, which shows
+    /// in its capacity (`Vec::with_capacity` reserves exactly what it's asked).
+    #[test]
+    fn regression_2026_10_19_plaintexts_are_never_reallocated() {
+        let put = |fields: usize| super::super::Op::Put {
+            kind: "set".into(),
+            id: "0195f4c2-7a1b-7c3d-8e4f-123456789abc".into(),
+            fields: (0..fields)
+                .map(|i| (format!("f{i}"), serde_json::json!(format!("value {i}"))))
+                .collect(),
+        };
+        let batches = [
+            Batch {
+                hlc: 1,
+                ops: vec![],
+            },
+            Batch {
+                hlc: 1,
+                ops: vec![super::super::Op::Del {
+                    kind: "set".into(),
+                    id: "a".into(),
+                }],
+            },
+            batch(),
+            Batch {
+                hlc: 1,
+                ops: vec![put(3)],
+            },
+            Batch {
+                hlc: u64::MAX,
+                ops: (0..40).map(put).collect(),
+            },
+        ];
+        for b in &batches {
+            let json = encode(FORMAT_JSON, b).unwrap();
+            assert_eq!(json.capacity(), json.len());
+            let binary = encode(FORMAT_BINARY, b).unwrap();
+            assert_eq!(binary.capacity(), codec::len_bound(b).div_ceil(PAD) * PAD);
+            assert_eq!(decode(FORMAT_JSON, &json).unwrap(), *b);
+            assert_eq!(decode(FORMAT_BINARY, &binary).unwrap(), *b);
+        }
+    }
+
+    #[test]
+    fn both_formats_are_read_and_others_refused() {
+        let (h, bytes) = file(2);
+        let c = read(&bytes, &key(), &h, &DEVICE).unwrap();
+        assert_eq!((c.format, c.header), (FORMAT_JSON, h));
+        // The expected header's format doesn't matter, only the rest.
+        let as_binary = header(FORMAT_BINARY, 1, &[9; 16], 1);
+        let c = read(&bytes, &key(), &as_binary, &DEVICE).unwrap();
+        assert_eq!((c.format, c.frames.len()), (FORMAT_JSON, 2));
+        let mut b = bytes.clone();
+        b[8..10].copy_from_slice(&3u16.to_le_bytes());
+        assert_eq!(
+            read(&b, &key(), &h, &DEVICE).unwrap_err(),
+            Error::Unsupported("journal format")
+        );
+        // A frame can't move to a file of the other format: the header,
+        // format included, is part of its associated data.
+        let mut b = bytes.clone();
+        b[8..10].copy_from_slice(&FORMAT_BINARY.to_le_bytes());
+        let c = read(&b, &key(), &h, &DEVICE).unwrap();
+        assert!(c.frames.is_empty());
+        assert!(matches!(c.end, End::Damaged(32, _)));
     }
 
     #[test]
@@ -379,8 +536,8 @@ mod tests {
             End::Damaged(_, _)
         ));
         // Another vault, generation or device.
-        let other_vault = header(1, &[8; 16], 1);
-        let other_gen = header(1, &[9; 16], 2);
+        let other_vault = header(FORMAT_JSON, 1, &[8; 16], 1);
+        let other_gen = header(FORMAT_JSON, 1, &[9; 16], 2);
         let moved = |hd: &Header| [hd.to_vec(), frames[0].clone(), frames[1].clone()].concat();
         for hd in [other_vault, other_gen] {
             let c = read(&moved(&hd), &key(), &hd, &DEVICE).unwrap();

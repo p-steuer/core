@@ -326,7 +326,7 @@ fn compaction_keeps_the_state_and_destroys_the_rest() {
     // The decrypted new journal holds no old or deleted value.
     let k = &v.opened().unwrap().keyring;
     let bytes = std::fs::read(tmp.path().join(journal::file_name(2))).unwrap();
-    let header = journal::header(k.suite, &k.vault_id, 2);
+    let header = journal::header(journal::FORMAT, k.suite, &k.vault_id, 2);
     let contents = journal::read(&bytes, &new_key, &header, &k.device_id).unwrap();
     let text: Vec<u8> = contents
         .frames
@@ -716,4 +716,74 @@ fn measure_years_of_daily_sessions() {
             journal_mb()
         );
     }
+}
+
+/// A journal in format 1, as MVP 1 wrote it, opens unchanged, keeps taking
+/// appends in format 1, and is rewritten in format 2 by the next compaction
+/// (D55).
+#[test]
+fn a_format_1_journal_is_read_and_migrated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = make(tmp.path());
+    let (key, k) = {
+        let o = v.opened().unwrap();
+        (o.journal.key.duplicate(), o.keyring.clone())
+    };
+    v.lock();
+    let header = journal::header(journal::FORMAT_JSON, k.suite, &k.vault_id, 1);
+    let batch = Batch {
+        hlc: 1 << 16,
+        ops: vec![Op::from(put(
+            "set",
+            "a",
+            json!({"reps": 5, "note": "kept"}),
+        ))],
+    };
+    let plaintext = journal::encode(journal::FORMAT_JSON, &batch).unwrap();
+    assert_eq!(plaintext[0], b'{');
+    let mut bytes = header.to_vec();
+    bytes.extend(
+        journal::seal_frame(
+            &key,
+            &header,
+            &k.device_id,
+            1,
+            &plaintext,
+            &mut TestRng::new("v1"),
+        )
+        .unwrap(),
+    );
+    std::fs::write(tmp.path().join(journal::file_name(1)), &bytes).unwrap();
+
+    let format_of = |name: &str| {
+        let b = std::fs::read(tmp.path().join(name)).unwrap();
+        u16::from_le_bytes([b[8], b[9]])
+    };
+    let mut v = unlock(tmp.path());
+    assert_eq!(v.status().damage, None);
+    assert_eq!(
+        v.record("set", "a").unwrap().unwrap().fields["note"],
+        "kept"
+    );
+    assert!(v.needs_compaction(), "an old format makes compaction due");
+    v.commit(vec![put("set", "b", json!({"reps": 6}))]).unwrap();
+    v.lock();
+    assert_eq!(format_of(&journal::file_name(1)), journal::FORMAT_JSON);
+
+    let mut v = unlock(tmp.path());
+    assert_eq!(v.records("set").unwrap().len(), 2);
+    v.compact().unwrap();
+    assert!(!v.needs_compaction());
+    let name = journal_name(&v);
+    assert_eq!(format_of(&name), journal::FORMAT_BINARY);
+    v.commit(vec![put("set", "c", json!({"reps": 7}))]).unwrap();
+    v.lock();
+
+    let v = unlock(tmp.path());
+    assert_eq!(v.status().damage, None);
+    assert_eq!(v.records("set").unwrap().len(), 3);
+    assert_eq!(
+        v.record("set", "a").unwrap().unwrap().fields["note"],
+        "kept"
+    );
 }

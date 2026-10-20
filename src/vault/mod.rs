@@ -37,7 +37,7 @@ use crate::keys::recovery::RecoveryKey;
 use crate::rand::{self, OsRng, Rng};
 use crate::store::hlc::{self, Clock};
 use crate::store::journal::{self, End};
-use crate::store::{self, Batch, Change, Op, Record, Store};
+use crate::store::{self, Batch, Change, Op, Record, Store, codec};
 use crate::{Error, Result};
 use keyring::{Keyring, KeyringKeys, PURPOSE_JOURNAL, PassphraseSlot, RecoverySlot};
 use lock::VaultLock;
@@ -137,7 +137,12 @@ impl PendingVault {
         remove_leftovers(&dir)?;
         // The empty journal first: until the keyring exists there is no vault,
         // and a later setup removes the journal again.
-        let header = journal::header(self.keyring.suite, &self.keyring.vault_id, 1);
+        let header = journal::header(
+            journal::FORMAT,
+            self.keyring.suite,
+            &self.keyring.vault_id,
+            1,
+        );
         let name = journal::file_name(1);
         dir.write_atomic(&name, &header)?;
         let backup_ok = save(&dir, &self.keyring)?;
@@ -157,6 +162,7 @@ impl PendingVault {
                 keyring: self.keyring,
                 journal: ActiveJournal {
                     generation: 1,
+                    format: journal::FORMAT,
                     key: self.journal_key,
                     header,
                     file,
@@ -220,6 +226,8 @@ impl Open {
 
 struct ActiveJournal {
     generation: u32,
+    /// The file's format: new frames are appended in it (D55).
+    format: u16,
     key: SecretKey,
     header: journal::Header,
     file: File,
@@ -285,10 +293,16 @@ impl Vault {
         else {
             return Err(Error::Damaged("journal missing"));
         };
-        let header = journal::header(keyring.suite, &keyring.vault_id, generation);
+        let expected = journal::header(
+            journal::FORMAT,
+            keyring.suite,
+            &keyring.vault_id,
+            generation,
+        );
         let name = journal::file_name(generation);
         let bytes = dir.read(&name)?.ok_or(Error::Damaged("journal missing"))?;
-        let contents = journal::read(&bytes, &key, &header, &keyring.device_id)?;
+        let contents = journal::read(&bytes, &key, &expected, &keyring.device_id)?;
+        let (format, header) = (contents.format, contents.header);
         let mut store = Store::default();
         // A journal newer than every key held means the keyring copy in use
         // is older than the data (e.g. a stale backup after the main copy was
@@ -299,7 +313,7 @@ impl Vault {
             .any(|g| *g > generation)
             .then_some("journal without its key");
         for (seq, plaintext) in &contents.frames {
-            match serde_json::from_slice::<Batch>(plaintext) {
+            match journal::decode(format, plaintext) {
                 Ok(batch) => store.apply(&batch, keyring.device_id, *seq),
                 Err(_) => {
                     damage = Some("journal batch");
@@ -345,6 +359,7 @@ impl Vault {
                 keyring,
                 journal: ActiveJournal {
                     generation,
+                    format,
                     key,
                     header,
                     file,
@@ -418,10 +433,7 @@ impl Vault {
             hlc: hlc::next(open.hlc, now),
             ops,
         };
-        let mut plaintext = Zeroizing::new(
-            serde_json::to_vec(&batch).map_err(|_| Error::Internal("encoding a batch"))?,
-        );
-        journal::pad(&mut plaintext);
+        let plaintext = journal::encode(open.journal.format, &batch)?;
         let j = &mut open.journal;
         let seq = j.next_seq;
         let frame = journal::seal_frame(
@@ -448,12 +460,16 @@ impl Vault {
     }
 
     /// Whether [`Vault::compact`] has work: deleted or overwritten values to
-    /// remove, or an earlier compaction to finish (an old key or file left
-    /// behind, or a backup copy of the keyring that couldn't be written).
-    /// Stays true until that is done (security review L4).
+    /// remove, a journal in an older format to rewrite (D55), or an earlier
+    /// compaction to finish (an old key or file left behind, or a backup copy
+    /// of the keyring that couldn't be written). Stays true until that is
+    /// done (security review L4).
     pub fn needs_compaction(&self) -> bool {
         self.open.as_ref().is_some_and(|o| {
-            o.store.needs_compaction() || o.cleanup_pending() || self.status.keyring_backup_stale
+            o.store.needs_compaction()
+                || o.journal.format != journal::FORMAT
+                || o.cleanup_pending()
+                || self.status.keyring_backup_stale
         })
     }
 
@@ -462,7 +478,8 @@ impl Vault {
     /// earlier compaction left.
     pub fn compact(&mut self) -> Result<()> {
         self.finish_compaction()?;
-        if !self.opened()?.store.needs_compaction() {
+        let open = self.opened()?;
+        if !open.store.needs_compaction() && open.journal.format == journal::FORMAT {
             return Ok(());
         }
         let now = self.config.clock.now_ms();
@@ -498,17 +515,18 @@ impl Vault {
         }
 
         // 2. The new journal, complete, under its final name.
-        let header = journal::header(open.keyring.suite, &open.keyring.vault_id, new);
+        let header = journal::header(
+            journal::FORMAT,
+            open.keyring.suite,
+            &open.keyring.vault_id,
+            new,
+        );
         let mut bytes = header.to_vec();
         let hlc = hlc::next(open.hlc, now);
         let mut seq = 0;
         for ops in split(open.store.snapshot()) {
             seq += 1;
-            let mut plaintext = Zeroizing::new(
-                serde_json::to_vec(&Batch { hlc, ops })
-                    .map_err(|_| Error::Internal("encoding a batch"))?,
-            );
-            journal::pad(&mut plaintext);
+            let plaintext = journal::encode(journal::FORMAT, &Batch { hlc, ops })?;
             bytes.extend(journal::seal_frame(
                 &key,
                 &header,
@@ -538,6 +556,7 @@ impl Vault {
         };
         open.journal = ActiveJournal {
             generation: new,
+            format: journal::FORMAT,
             key,
             header,
             file,
@@ -972,7 +991,9 @@ fn clean_up_blobs(blobs: &Dir, store: &Store) -> Result<()> {
     Ok(())
 }
 
-/// Splits snapshot operations into batches of about [`SNAPSHOT_BATCH`] bytes.
+/// Splits snapshot operations into batches of up to [`SNAPSHOT_BATCH`] bytes,
+/// counted with the codec's upper bounds so nothing is encoded twice (the
+/// bounds are generous: with typical records a batch comes to 20–36 KB).
 /// A record too big for one batch becomes several snapshot operations with
 /// some of its fields each; they merge back into the same record (security
 /// review L3: one big record made every compaction fail).
@@ -981,7 +1002,7 @@ fn split(ops: Vec<Op>) -> Vec<Vec<Op>> {
     let mut current = Vec::new();
     let mut size = 0;
     for op in ops.into_iter().flat_map(split_record) {
-        let n = encoded_len(&op);
+        let n = codec::op_len(&op);
         if !current.is_empty() && size + n > SNAPSHOT_BATCH {
             batches.push(std::mem::take(&mut current));
             size = 0;
@@ -996,10 +1017,10 @@ fn split(ops: Vec<Op>) -> Vec<Vec<Op>> {
 }
 
 /// One record's snapshot as parts of at most [`SNAPSHOT_BATCH`] bytes (a
-/// single field is at most 64 KiB of text, under 400 KiB as JSON, so every
-/// part fits into a journal frame).
+/// single field is at most 64 KiB of text, so every part fits into a journal
+/// frame).
 fn split_record(op: Op) -> Vec<Op> {
-    if encoded_len(&op) <= SNAPSHOT_BATCH {
+    if codec::op_len(&op) <= SNAPSHOT_BATCH {
         return vec![op];
     }
     let Op::Snap {
@@ -1015,7 +1036,7 @@ fn split_record(op: Op) -> Vec<Op> {
     let mut part = Vec::new();
     let mut size = 0;
     for field in fields {
-        let n = encoded_len(field);
+        let n = codec::field_len(field);
         if !part.is_empty() && size + n > SNAPSHOT_BATCH {
             parts.push(Op::Snap {
                 kind: kind.clone(),
@@ -1035,23 +1056,6 @@ fn split_record(op: Op) -> Vec<Op> {
         fields: part,
     });
     parts
-}
-
-/// The length of a value as JSON, counted without keeping a copy of it.
-fn encoded_len<T: serde::Serialize>(value: &T) -> usize {
-    struct Count(usize);
-    impl std::io::Write for Count {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0 += b.len();
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut count = Count(0);
-    let _ = serde_json::to_writer(&mut count, value);
-    count.0
 }
 
 fn hex32(b: &[u8; 32]) -> Zeroizing<String> {

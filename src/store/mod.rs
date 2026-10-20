@@ -7,6 +7,7 @@
 //! result doesn't depend on the order in which batches arrive (later: from
 //! other devices).
 
+pub(crate) mod codec;
 pub(crate) mod hlc;
 pub(crate) mod journal;
 

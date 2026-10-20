@@ -351,11 +351,15 @@ proptest! {
             s.apply_op(op, *stamp);
         }
         prop_assert_eq!(visible(&s.compacted()), visible(&s));
-        // Replaying the snapshot through JSON gives the same, too.
-        let text = serde_json::to_vec(&Batch { hlc: 99, ops: s.snapshot() }).unwrap();
-        let mut replayed = Store::default();
-        replayed.apply(&serde_json::from_slice(&text).unwrap(), DEV_A, 1);
-        prop_assert_eq!(visible(&replayed), visible(&s));
+        // Replaying the snapshot through either journal format gives the
+        // same, too.
+        let batch = Batch { hlc: 99, ops: s.snapshot() };
+        for format in [journal::FORMAT_JSON, journal::FORMAT_BINARY] {
+            let plaintext = journal::encode(format, &batch).unwrap();
+            let mut replayed = Store::default();
+            replayed.apply(&journal::decode(format, &plaintext).unwrap(), DEV_A, 1);
+            prop_assert_eq!(visible(&replayed), visible(&s));
+        }
     }
 
     #[test]

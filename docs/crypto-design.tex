@@ -31,7 +31,7 @@
 \newcommand{\todo}[1]{\textcolor{red!70!black}{[\textbf{Open:} #1]}}
 \newcommand{\dref}[1]{\textsf{#1}} % reference to the decision log in APPDESIGN.md
 
-\title{Cryptographic design of the security core\\[2pt]\large Draft 0.5}
+\title{Cryptographic design of the security core\\[2pt]\large Draft 0.6}
 \author{Internal working document}
 \date{19 October 2026}
 
@@ -39,7 +39,7 @@
 \maketitle
 
 \begin{abstract}
-This document specifies the cryptography of the app's security core (the Rust crate \texttt{secure\_core}): goals, threat model, primitives and cipher suites, the key hierarchy, data at rest, synchronisation, device pairing and sharing. Draft 0.2 added what milestone M1 of MVP~1 implements: the libraries and parameters of suite~1, passphrase handling, the recovery key and the keyring file (\cref{sec:passphrase,sec:recovery,sec:keyring}). Draft 0.3 adds milestone M2: the journal, merging, compaction and encrypted files (\cref{sec:rest}). Draft 0.4 adds the hardening of milestone M8: what the finished app writes and logs, platform backups, and the assurance checks (\cref{sec:ondisk,sec:assurance}). Draft 0.5 adds the fixes from the security review of M8: compaction only with both keyring copies written, the slot of the keyring copy in use, what is wiped from memory, file modes, the picker's photo copies, and locking while the app is in the background. It turns the decisions and proposals of the project's decision log (\texttt{APPDESIGN.md}; identifiers such as \dref{D9} or \dref{P43}) into a precise design that can be reviewed, formally analysed and implemented. Everything not yet decided is marked \todo{like this}. The app's name is deliberately absent; it lives only in the app's \texttt{branding.json} (\dref{D35}).
+This document specifies the cryptography of the app's security core (the Rust crate \texttt{secure\_core}): goals, threat model, primitives and cipher suites, the key hierarchy, data at rest, synchronisation, device pairing and sharing. Draft 0.2 added what milestone M1 of MVP~1 implements: the libraries and parameters of suite~1, passphrase handling, the recovery key and the keyring file (\cref{sec:passphrase,sec:recovery,sec:keyring}). Draft 0.3 adds milestone M2: the journal, merging, compaction and encrypted files (\cref{sec:rest}). Draft 0.4 adds the hardening of milestone M8: what the finished app writes and logs, platform backups, and the assurance checks (\cref{sec:ondisk,sec:assurance}). Draft 0.5 adds the fixes from the security review of M8: compaction only with both keyring copies written, the slot of the keyring copy in use, what is wiped from memory, file modes, the picker's photo copies, and locking while the app is in the background. Draft 0.6 adds journal format~2, a binary encoding of the batches (\dref{D55}, \cref{sec:rest}). It turns the decisions and proposals of the project's decision log (\texttt{APPDESIGN.md}; identifiers such as \dref{D9} or \dref{P43}) into a precise design that can be reviewed, formally analysed and implemented. Everything not yet decided is marked \todo{like this}. The app's name is deliberately absent; it lives only in the app's \texttt{branding.json} (\dref{D35}).
 \end{abstract}
 
 \tableofcontents
@@ -159,7 +159,7 @@ Randomness & The operating system's CSPRNG & \texttt{getrandom} 0.4.3 \\
   \item \textbf{Optional secret key} (\dref{P18}): \todo{decide}.
 \end{enumerate}
 
-\noindent\textbf{Key handling (memory)}: keys exist only inside the core; the user interface receives opaque handles. Every 256-bit key is a \texttt{SecretKey} on the heap (so moves leave no stack copies) and is wiped when dropped (\texttt{zeroize}); decrypted plaintext comes back in wiped buffers, and the texts of the records held in memory (including the core's file keys) are overwritten when the vault locks; Debug output shows names but never values, keys, salts or commitments (security review of M8). Argon2id's 64\,MiB work area is supplied by the core and wiped after each hash, because \texttt{argon2} 0.6.0's own \texttt{hash\_password\_into} frees it without wiping (its \texttt{block.rs}, checked 18 Oct 2026). \emph{Not} wiped: the copies of the passphrase and the recovery key in Dart and in the bridge's transfer buffers, the records the app has received in Dart, numbers inside the core's records, and zxcvbn's internal copies during the strength check (HMAC and SHA-256 states are wiped since M8, through their \texttt{zeroize} features). Memory locking (\texttt{mlock}) is not used yet.
+\noindent\textbf{Key handling (memory)}: keys exist only inside the core; the user interface receives opaque handles. Every 256-bit key is a \texttt{SecretKey} on the heap (so moves leave no stack copies) and is wiped when dropped (\texttt{zeroize}); decrypted plaintext comes back in wiped buffers, a batch's plaintext is encoded into a buffer reserved at its final size (padding included, so no reallocation leaves a copy behind; fixed 19 October 2026), and the texts of the records held in memory (including the core's file keys) are overwritten when the vault locks; Debug output shows names but never values, keys, salts or commitments (security review of M8). Argon2id's 64\,MiB work area is supplied by the core and wiped after each hash, because \texttt{argon2} 0.6.0's own \texttt{hash\_password\_into} frees it without wiping (its \texttt{block.rs}, checked 18 Oct 2026). \emph{Not} wiped: the copies of the passphrase and the recovery key in Dart and in the bridge's transfer buffers, the records the app has received in Dart, numbers inside the core's records, and zxcvbn's internal copies during the strength check (HMAC and SHA-256 states are wiped since M8, through their \texttt{zeroize} features). Memory locking (\texttt{mlock}) is not used yet.
 
 \section{Passphrases}
 \label{sec:passphrase}
@@ -295,28 +295,39 @@ checksum (32) & SHA-256 of everything before \\
 \label{sec:journal}
 A record (set, session, measurement, \ldots) is a kind, an identifier (UUID version~7) and flat fields: numbers, text, booleans. The core knows nothing about what they mean. Draft 0.1 encrypted each record on its own; MVP~1 instead keeps an append-only encrypted \emph{journal} of operation batches (\dref{P59}), replayed into memory at unlock; the app queries in memory. Edits and deletions are new operations. Identifiers, kinds, field names and timestamps are all inside the ciphertext.
 
-\noindent\textbf{File format~1} (one file per generation $g$, \texttt{journal-}$g$\texttt{.log}, little-endian):
+\noindent\textbf{The file} (one per generation $g$, \texttt{journal-}$g$\texttt{.log}, little-endian; formats~1 and~2 share this layout):
 \begin{center}\small
 \begin{tabularx}{\textwidth}{@{}lX@{}}
 \toprule
-header (32 bytes) & magic \texttt{SCJOURNL}, format (u16, 1), suite (u16), $\mathit{vault\_id}$ (16), generation $g$ (u32) \\
+header (32 bytes) & magic \texttt{SCJOURNL}, format (u16: 1 or 2), suite (u16), $\mathit{vault\_id}$ (16), generation $g$ (u32) \\
 each frame & $\ell$ (u32), $\lnot\ell$ (u32), kind (u8, 1 = batch), $\mathit{device\_id}$ (16), $\mathit{seq}$ (u64), nonce (24), ciphertext with tag ($\ell - 49$) \\
 \bottomrule
 \end{tabularx}
 \end{center}
-A frame is $\AEAD.\Enc(K_{j,g}, n, \mathit{batch}, \mathit{header} \concat \ell \concat \lnot\ell \concat \mathit{kind} \concat \mathit{device\_id} \concat \mathit{seq})$, so it can't be moved to another vault, generation, device or position. $\mathit{seq}$ starts at 1 in every file and increases by one. The plaintext is a JSON batch $\{\mathit{hlc}, \mathit{ops}\}$, padded with spaces to a multiple of 128 bytes, at most 1\,MiB. Operations: \emph{put} (set fields; others stay; \texttt{null} clears one), \emph{del} (a tombstone) and \emph{snap} (written by compaction, below).
+A frame is $\AEAD.\Enc(K_{j,g}, n, \mathit{batch}, \mathit{header} \concat \ell \concat \lnot\ell \concat \mathit{kind} \concat \mathit{device\_id} \concat \mathit{seq})$, so it can't be moved to another vault, generation, device or position. $\mathit{seq}$ starts at 1 in every file and increases by one. The plaintext is a batch $\{\mathit{hlc}, \mathit{ops}\}$, at most 1\,MiB, padded to a multiple of 128 bytes. Operations: \emph{put} (set fields; others stay; \texttt{null} clears one), \emph{del} (a tombstone) and \emph{snap} (written by compaction, below).
 
-\noindent\textbf{Growth over decades} (measured 19 October 2026, \dref{P94}). The journal stays close to the live data thanks to compaction, but unlock replays all of it into memory. One strength session a day gives 8\,MB a year. After 10 years that means 0.6\,s more to unlock and 365\,MB of memory in the core on a desktop; after 50 years, 3.1\,s and 1.9\,GB. Two causes:
+\noindent\textbf{Format~2} (\dref{D55}, since 19 October 2026) encodes the batch in binary instead of JSON (MVP~1's format~1, padded with spaces):
 \begin{itemize}
-  \item every field carries its own merge stamp (about 70 bytes of JSON);
+  \item \textbf{Tables per batch:} a table of the kinds and field names, and one of the devices that snapshot stamps refer to. Operations point into them, so every frame still decodes on its own.
+  \item \textbf{One stamp per group:} a snapshot keeps one stamp per group of fields written together, instead of one per field.
+  \item \textbf{Compact values:} ids and texts in canonical UUID form take 16 bytes. Integers are minimal LEB128 varints, negative ones stored as $-1-n$. Floats are 8 bytes and must be finite.
+  \item \textbf{Zero padding,} instead of spaces.
+  \item \textbf{Strict decoding:} counts are checked against the bytes left, indexes against the tables; varints must be minimal and texts UTF-8; names must be unique within a record; groups come in increasing stamp order; only zeros may follow the batch.
+\end{itemize}
+The format sits in the header, and the header is part of every frame's associated data, so a frame can't move to a file of the other format. Unlock reads both formats. A file keeps its format for appends, and a journal in format~1 makes compaction due, which rewrites it in format~2. Tests: round trips (also as property tests), the size bound used to split compaction batches, a golden file, refusal of every truncation and malformed field, random and damaged inputs without panics, and the migration from format~1.
+
+\noindent\textbf{Growth over decades} (measured 19 October 2026, \dref{D55}). The journal stays close to the live data thanks to compaction, but unlock replays all of it into memory. With format~1, one strength session a day gave 8\,MB a year. After 10 years that meant 0.6\,s more to unlock and 365\,MB of memory in the core on a desktop; after 50 years, 3.1\,s and 1.9\,GB. Two causes:
+\begin{itemize}
+  \item every field carried its own merge stamp (about 70 bytes of JSON);
   \item the whole history is kept in memory.
 \end{itemize}
-The proposal:
+The plan:
 \begin{itemize}
-  \item journal format~2: one stamp per group of fields, devices as small numbers, binary batches;
-  \item archive segments per year with their own keys, decrypted on demand, with summary records in the current segment.
+  \item journal format~2 (above, done): 0.9\,MB a year, and unlock about twice as fast after 25 and 50 years; memory is unchanged;
+  \item a compact store in memory;
+  \item archive segments per year with their own keys, decrypted on demand, with summary records in the current segment. A year is archived only once it is two years old, so the current and the previous year are always loaded (\dref{D55}).
 \end{itemize}
-Deleting a record in an archive rewrites that segment under a new key, so crypto-shredding still holds \todo{format 2 and archive segments}.
+Deleting a record in an archive rewrites that segment under a new key, so crypto-shredding still holds \todo{the compact store and archive segments}.
 
 \noindent\textbf{Nonces, and no encryption in place.} ChaCha20 is a stream cipher. Encrypting two different plaintexts under the same key and nonce would reveal their XOR, and Poly1305 would then allow forgeries. That is the classic problem of data at rest rewritten in place. The core never does it:
 \begin{itemize}
